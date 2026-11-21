@@ -50,7 +50,8 @@ type CarrierBinding struct {
 // Result remains in the tenant task process. Only Summary is sent to the
 // conductor; PreparedSource is appended to sandbox-ctl argv by node-ctl.
 type Result struct {
-	PreparedSource types.ResumeSource
+	cacheResolution canonicalResolution
+	PreparedSource  types.ResumeSource
 	// SourceSandboxConfig and SourceImageConfig stay in the tenant task. Build
 	// source normalization uses them after an S root has converged to its E;
 	// neither document crosses back into the conductor.
@@ -93,7 +94,7 @@ type canonicalResolution struct {
 // Prepare opens the claimed E/S root, validates its logical role, resolves the
 // launch-mode-specific source, and computes the exact ref closure. It does not
 // start a runner, VM, network, or any other runtime side effect.
-func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, error) {
+func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, error) {
 	started := time.Now()
 	sourceKind := types.ResumeSourceKind(spec.RootSourceKind)
 	launchMode := types.LaunchMode(spec.LaunchMode)
@@ -209,6 +210,13 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 			return nil, fmt.Errorf("task artifact prepare: initialize Snapshot reader: %w", err)
 		}
 		document, readErr := reader.Read(ctx, spec.RootRef, restore.SnapshotCfgReadOptions{
+			PrepareSandboxRef: func(raw string) error {
+				name, err := refLocationName(raw)
+				if err != nil {
+					return err
+				}
+				return addLocation("selected Sandbox E", name)
+			},
 			RefLocations: pathLocations,
 			RelativeDir:  spec.RelativeDir,
 		})
@@ -430,6 +438,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 		prepared.Ref = ref.String()
 	}
 	return &Result{
+		cacheResolution:     canonical,
 		PreparedSource:      prepared,
 		SourceSandboxConfig: sourceSandboxConfig,
 		SourceImageConfig:   append([]byte(nil), sourceImageConfig...),

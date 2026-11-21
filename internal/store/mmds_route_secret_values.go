@@ -172,33 +172,94 @@ func (s *Store) insertInitialMMDSRouteSecretValuesTx(ctx context.Context, tx *sq
 // routes-only metadata already held by sb, and its optional encrypted initial
 // values. No row from either half remains if the transaction fails.
 func (s *Store) InsertSandboxWithMMDSRouteSecretValues(ctx context.Context, sb *types.Sandbox, routesDigest string, values MMDSRouteSecretValues) error {
-	args, err := s.prepareSandboxInsert(sb)
-	if err != nil {
-		return sandboxWriteError("insert sandbox", sb, err)
+	_, err := s.insertSandboxWithPreparedVM(ctx, sb, routesDigest, values, "")
+	return err
+}
+
+// InsertSandboxWithPreparedVM publishes the new sandbox and transfers the exact
+// pool lease in one FULL-synchronous transaction. A crash exposes either the
+// original pool owner or the complete starting sandbox, never an unowned port.
+func (s *Store) InsertSandboxWithPreparedVM(ctx context.Context, sb *types.Sandbox, routesDigest string, values MMDSRouteSecretValues, runID string) (*PreparedVMLease, error) {
+	if runID == "" {
+		return nil, errors.New("empty prepared runner")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	return s.insertSandboxWithPreparedVM(ctx, sb, routesDigest, values, runID)
+}
+
+func (s *Store) insertSandboxWithPreparedVM(ctx context.Context, sb *types.Sandbox, routesDigest string, values MMDSRouteSecretValues, runID string) (*PreparedVMLease, error) {
+	id := ""
+	if sb != nil {
+		id = sb.ID
+	}
+	mark, finish := admissionTiming("insert", id)
+	defer finish()
+	var args []any
+	var err error
+	if runID == "" {
+		args, err = s.prepareSandboxInsert(sb)
+	} else if sb == nil || sb.ID != runID || sb.State != types.StateStarting || sb.RunID != "" || sb.VswitchPort != "" {
+		return nil, errors.New("prepared insert requires a fresh exact-identity starting owner")
+	}
 	if err != nil {
-		return sandboxWriteError("insert sandbox", sb, err)
+		return nil, sandboxWriteError("insert sandbox", sb, err)
+	}
+	mark("encode")
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	mark("connection_wait")
+	tx, err := conn.BeginTx(ctx, nil)
+	mark("sqlite_writer_wait")
+	if err != nil {
+		return nil, sandboxWriteError("insert sandbox", sb, err)
 	}
 	defer tx.Rollback()
+	var lease *PreparedVMLease
+	if runID != "" {
+		lease, err = readPreparedVMTx(ctx, tx, sb.ID, runID)
+		if err != nil {
+			return nil, err
+		}
+		owned := *sb
+		owned.RunID = lease.RunID
+		owned.VswitchPort = lease.Port
+		owned.FloatingIP = lease.FloatingIP
+		owned.InnerIP = lease.InnerIP
+		owned.PortMAC = lease.MAC
+		args, err = s.prepareSandboxInsert(&owned)
+		if err != nil {
+			return nil, sandboxWriteError("insert sandbox", sb, err)
+		}
+	}
 	result, err := tx.ExecContext(ctx, sandboxInsertOnlySQL, args...)
 	if err != nil {
-		return sandboxWriteError("insert sandbox", sb, err)
+		return nil, sandboxWriteError("insert sandbox", sb, err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return sandboxWriteError("insert sandbox", sb, err)
+		return nil, sandboxWriteError("insert sandbox", sb, err)
 	}
 	if inserted == 0 {
-		return sandboxWriteError("insert sandbox", sb, ErrSandboxExists)
+		return nil, sandboxWriteError("insert sandbox", sb, ErrSandboxExists)
 	}
 	if err := s.insertInitialMMDSRouteSecretValuesTx(ctx, tx, MMDSRouteSecretOwnerSandbox, sb.ID, routesDigest, values); err != nil {
-		return err
+		return nil, err
 	}
+	if lease != nil {
+		// Insert the final owner once, instead of inserting an unassigned row
+		// and rewriting it. The lease disappears in the same FULL transaction.
+		if _, err = tx.ExecContext(ctx, "DELETE FROM prepared_vm_leases WHERE run_id=?", runID); err != nil {
+			return nil, err
+		}
+	}
+	mark("transaction_work")
 	if err := tx.Commit(); err != nil {
-		return sandboxWriteError("insert sandbox", sb, err)
+		return nil, sandboxWriteError("insert sandbox", sb, err)
 	}
-	return nil
+	mark("durable_commit")
+	return lease, nil
 }
 
 // InsertBuildWithMMDSRouteSecretValues is the Build Register equivalent of the

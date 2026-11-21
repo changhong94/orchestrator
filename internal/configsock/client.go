@@ -165,28 +165,47 @@ func OpenRunSession(ctx context.Context, socket, kind, runID string) (*RunSessio
 }
 
 func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, error) {
-	body, _ := json.Marshal(AssignmentRequest{Kind: kind, RunID: runID})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunAssignment, bytes.NewReader(body))
+	out, err := waitAssignment(ctx, socket, kind, runID, 0)
 	if err != nil {
 		return "", err
+	}
+	return out.TaskID, nil
+}
+func WaitSandboxBootstrap(ctx context.Context, socket, runID string) (*AssignmentResponse, error) {
+	out, err := waitAssignment(ctx, socket, "sandbox", runID, SandboxBootstrapVersion)
+	if err != nil {
+		return nil, err
+	}
+	// A legacy controller may omit the optional field; the caller fetches the
+	// ordinary authenticated bootstrap in that case.
+	if out.Bootstrap != nil && (out.Bootstrap.SandboxID != out.TaskID || out.Bootstrap.RunID != runID) {
+		return nil, errors.New("assignment bootstrap identity mismatch")
+	}
+	return out, nil
+}
+func waitAssignment(ctx context.Context, socket, kind, runID string, bootstrapVersion int) (*AssignmentResponse, error) {
+	body, _ := json.Marshal(AssignmentRequest{Kind: kind, RunID: runID, BootstrapVersion: bootstrapVersion})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunAssignment, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
 	if err != nil {
-		return "", &transportError{err: err}
+		return nil, &transportError{err: err}
 	}
 	defer resp.Body.Close()
 	var out AssignmentResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", &transportError{err: fmt.Errorf("configsock: decode assignment: %w", err)}
+		return nil, &transportError{err: fmt.Errorf("configsock: decode assignment: %w", err)}
 	}
 	if out.Error != "" || resp.StatusCode >= http.StatusBadRequest {
-		return "", buildResponseError(resp.StatusCode, out.Error)
+		return nil, buildResponseError(resp.StatusCode, out.Error)
 	}
 	if out.TaskID == "" {
-		return "", errors.New("empty assignment")
+		return nil, errors.New("empty assignment")
 	}
-	return out.TaskID, nil
+	return &out, nil
 }
 
 type transportError struct{ err error }

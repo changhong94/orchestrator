@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,7 +31,10 @@ import (
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
 // optional task-local artifact preparation, and starts the sandbox-ctl child.
 // runAssignedSandbox has locked the run pidfile before this function is called.
-func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger, prepared ...*preparedSandboxChild) error {
+	return launchTaskWithBootstrap(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, log, nil, prepared...)
+}
+func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger, bootstrap *configsock.SandboxTaskSpec, prepared ...*preparedSandboxChild) error {
 	// Keep a registered signal channel across the handoff from preparation to
 	// the runtime, including the file baseline read before Start.
 	stopSignals := make(chan os.Signal, 2)
@@ -38,8 +42,40 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 	defer signal.Stop(stopSignals)
 	var metricsIdentity runnerMetricsIdentity
 	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
-		fetchBootstrap:  configsock.FetchSandboxTaskSpec,
-		prepareArtifact: taskartifact.Prepare,
+		fetchBootstrap: func(ctx context.Context, socket, sid, rid string) (*configsock.SandboxTaskSpec, error) {
+			if bootstrap != nil {
+				return bootstrap, nil
+			}
+			return configsock.FetchSandboxTaskSpec(ctx, socket, sid, rid)
+		},
+		prepareArtifact: func(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*taskartifact.Result, error) {
+			var result *taskartifact.Result
+			var err error
+			if len(prepared) > 0 && prepared[0] != nil {
+				for _, material := range prepared[0].materials {
+					var hit bool
+					result, hit, err = material.Claim(ctx, spec)
+					if err != nil {
+						result = nil
+						break
+					}
+					if hit {
+						break
+					}
+				}
+				// Assignment is one-shot. Do not retain other tenants' material.
+				prepared[0].materials = nil
+			}
+			if result == nil {
+				result, err = taskartifact.Prepare(ctx, spec)
+			}
+			if err == nil && spec.SnapshotRuntime != "" && len(prepared) > 0 && prepared[0] != nil && result.PreparedSource.Kind == types.ResumeSourceSnapshot && strings.HasPrefix(result.PreparedSource.Ref, "file://") {
+				err = json.NewEncoder(prepared[0].input).Encode(map[string]any{"source": map[string]any{
+					"ref": result.PreparedSource.Ref, "sandbox_hint": result.PreparedSource.SandboxRef, "locations": result.RefLocationURIs, "manifest_config": spec.ManifestConfig,
+				}, "env": taskEnv(nil)})
+			}
+			return result, err
+		},
 		completePrepare: configsock.CompleteSandboxPrepare,
 		setenv:          os.Setenv,
 		chdir:           os.Chdir,
@@ -47,6 +83,9 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
 		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
+			if len(prepared) > 0 && prepared[0] != nil {
+				return prepared[0].launchAndReport(socket, sandboxID, runID, path, argv, env, ready, metricsIdentity, stopSignals, log)
+			}
 			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
 		},
 		log: log,
@@ -85,10 +124,13 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if ops.log == nil {
 		ops.log = slog.Default()
 	}
+	markStage, flushStages := traceLaunchStages("task")
+	defer flushStages()
 	bootstrap, err := ops.fetchBootstrap(ctx, socket, sandboxID, runID)
 	if err != nil {
 		return fmt.Errorf("fetch sandbox task bootstrap: %w", err)
 	}
+	markStage("bootstrap_rpc")
 	if bootstrap.SandboxID != sandboxID || bootstrap.RunID != runID {
 		return fmt.Errorf("sandbox task bootstrap identity mismatch")
 	}
@@ -129,12 +171,14 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	locations := map[string]string{}
 	var preparedSource types.ResumeSource
 	if bootstrap.Prepare != nil {
+		markStage("environment")
 		result, err := ops.prepareArtifact(taskCtx, *bootstrap.Prepare)
 		if err != nil {
 			ops.log.Error("sandbox task artifact prepare failed", "sid", sandboxID, "run_id", runID,
 				"task_artifact_prepare_error_total", 1, "stage", "artifact_prepare", "err", err)
 			return err
 		}
+		markStage("artifact_cache")
 		locations = result.RefLocationURIs
 		preparedSource = result.PreparedSource
 		ops.log.Info("sandbox task artifact prepared", "sid", sandboxID, "run_id", runID,
@@ -146,6 +190,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 			return fmt.Errorf("complete sandbox artifact preparation: %w", err)
 		}
 	}
+	markStage("summary_handoff_rpc")
 	if spec == nil {
 		return fmt.Errorf("sandbox task has no final launch spec")
 	}
@@ -175,12 +220,23 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	}
 	argv := []string{spec.Exec, "run"}
 	argv = append(argv, spec.Args[1:]...)
-	if !preparedSource.Empty() {
+	nativeFork := false
+	for _, arg := range spec.Args {
+		if arg == "--native-fork-parent" {
+			nativeFork = true
+		}
+	}
+	// A running-parent fork derives its disk and process state at the live
+	// capture barrier, not from the parent's historical template artifact.
+	if !preparedSource.Empty() && !nativeFork {
 		switch preparedSource.Kind {
 		case types.ResumeSourceSandbox:
 			argv = append(argv, "--from", preparedSource.Ref)
 		case types.ResumeSourceSnapshot:
 			argv = append(argv, "--restore", preparedSource.Ref)
+			if strings.HasPrefix(preparedSource.SandboxRef, "file://") {
+				argv = append(argv, "--restore-sandbox-hint", preparedSource.SandboxRef)
+			}
 		default:
 			return fmt.Errorf("task prepared unsupported source kind %q", preparedSource.Kind)
 		}
@@ -195,6 +251,8 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	if ops.startChild == nil {
 		return errors.New("sandbox child starter is not configured")
 	}
+	markStage("child_arguments")
+	flushStages()
 	return ops.startChild(spec.Exec, argv, env, vmmCgroup, ready)
 }
 
@@ -287,7 +345,8 @@ func launchSpecCgroupArg(args []string) (string, bool) {
 func launchSpecArtifactArg(args []string) (string, bool) {
 	for _, arg := range args {
 		if arg == "--from" || strings.HasPrefix(arg, "--from=") ||
-			arg == "--restore" || strings.HasPrefix(arg, "--restore=") {
+			arg == "--restore" || strings.HasPrefix(arg, "--restore=") ||
+			arg == "--restore-sandbox-hint" || strings.HasPrefix(arg, "--restore-sandbox-hint=") {
 			return arg, true
 		}
 	}
@@ -393,6 +452,10 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		_ = cmd.Process.Signal(sig)
 	default:
 	}
+	return finishSandboxChildAndReport(cmd.Wait, socket, sandboxID, runID, metrics)
+}
+
+func finishSandboxChildAndReport(wait func() error, socket, sandboxID, runID string, metrics *runnerMetrics) error {
 	var stop context.CancelFunc
 	var sampled chan struct{}
 	if metrics != nil {
@@ -402,7 +465,7 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		sampled = make(chan struct{})
 		go metrics.sampleUntil(sampleCtx, sampled)
 	}
-	err := cmd.Wait()
+	err := wait()
 	if metrics != nil {
 		stop()
 		<-sampled

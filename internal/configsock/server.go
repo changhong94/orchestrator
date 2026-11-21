@@ -104,15 +104,17 @@ const (
 )
 
 type AssignmentRequest struct {
-	Kind  string `json:"kind"`
-	RunID string `json:"run_id"`
+	BootstrapVersion int    `json:"bootstrap_version,omitempty"`
+	Kind             string `json:"kind"`
+	RunID            string `json:"run_id"`
 }
 
 type AssignmentResponse struct {
-	Kind   string `json:"kind,omitempty"`
-	RunID  string `json:"run_id,omitempty"`
-	TaskID string `json:"task_id,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Bootstrap *SandboxTaskSpec `json:"bootstrap,omitempty"`
+	Kind      string           `json:"kind,omitempty"`
+	RunID     string           `json:"run_id,omitempty"`
+	TaskID    string           `json:"task_id,omitempty"`
+	Error     string           `json:"error,omitempty"`
 }
 
 type RunSessionRequest struct {
@@ -567,6 +569,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
 	mux.HandleFunc("PUT "+PathRunSession, s.handleRunSession)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
+	mux.HandleFunc("POST "+PathRunPrepareVM, s.handleRunPrepareVM)
 	mux.HandleFunc("POST "+PathRunSandboxResult, s.handleSandboxResult)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)
@@ -860,7 +863,46 @@ func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, &AssignmentResponse{Error: "unknown run"})
 		return
 	}
-	writeJSON(w, http.StatusOK, &AssignmentResponse{Kind: req.Kind, RunID: req.RunID, TaskID: taskID})
+	assignedAt := time.Now()
+	authDone, specDone := assignedAt, assignedAt
+	defer func() {
+		s.log.Info("assignment bootstrap stages", "run_id", req.RunID, "assigned_ns", assignedAt.UnixNano(), "auth_ns", authDone.Sub(assignedAt).Nanoseconds(), "spec_ns", specDone.Sub(authDone).Nanoseconds(), "write_ns", time.Since(specDone).Nanoseconds())
+	}()
+	out := &AssignmentResponse{Kind: req.Kind, RunID: req.RunID, TaskID: taskID}
+	if req.BootstrapVersion != 0 {
+		if req.Kind != "sandbox" || req.BootstrapVersion != SandboxBootstrapVersion {
+			writeJSON(w, http.StatusBadRequest, &AssignmentResponse{Error: "unsupported bootstrap version"})
+			return
+		}
+		// Assignment publication already passed the proxy admission barrier. Repeat
+		// exact task/run peer authorization before exposing any decrypted secret.
+		auth, found, err := s.deps.Provider.SandboxTaskAuth(r.Context(), taskID, req.RunID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, &AssignmentResponse{Error: "internal error"})
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, &AssignmentResponse{Error: "unknown task"})
+			return
+		}
+		if !s.taskAuthed("sandbox:"+taskID+":"+req.RunID, auth.PidFile, peer) {
+			writeJSON(w, http.StatusForbidden, &AssignmentResponse{Error: "not authorized"})
+			return
+		}
+		authDone = time.Now()
+		spec, found, err := s.deps.Provider.SandboxTaskSpecFor(r.Context(), taskID, req.RunID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, &AssignmentResponse{Error: "internal error"})
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, &AssignmentResponse{Error: "unknown task"})
+			return
+		}
+		specDone = time.Now()
+		out.Bootstrap = spec
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleSandboxResult(w http.ResponseWriter, r *http.Request) {

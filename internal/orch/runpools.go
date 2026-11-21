@@ -25,6 +25,9 @@ func newRunPools(kind string, configs []config.RunPoolConfig, wait time.Duration
 	for i, cfg := range configs {
 		p := newRunPool(kind, cfg.Size, wait, root, lc, func(id string) string { return instanceUnit(cfg.Unit, id) }, log.With("pool", i, "unit", cfg.Unit))
 		p.runs = runs
+		p.preparedVM = cfg.PreparedVM
+		p.preparedRestore = cfg.PreparedRestore
+		p.prepareConcurrency = cfg.PrepareConcurrency
 		p.name, p.resourcePool, p.capacity, p.priority = cfg.PoolName(logicalPoolKind(kind), i), cfg.ResourcePoolName(), cfg.Capacity, cfg.Priority
 		out.pools = append(out.pools, p)
 	}
@@ -63,6 +66,9 @@ func (p *runPools) assignInResourcePool(ctx context.Context, resourcePool, taskI
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
 	for _, pool := range candidates {
+		if pool.preparedVM {
+			continue
+		}
 		if resourcePool != "" && pool.resourcePool != resourcePool {
 			continue
 		}
@@ -74,6 +80,26 @@ func (p *runPools) assignInResourcePool(ctx context.Context, resourcePool, taskI
 		return pool.assignWithReservation(ctx, taskID, sessionFence, commit, reservation)
 	}
 	return "", fmt.Errorf("no runner supply in resource pool %q", resourcePool)
+}
+
+// AssignNew uses the same capacity reservations and priority order as ordinary
+// assignments. A prepared VM changes when identity is chosen, not admission.
+func (p *runPools) AssignNew(ctx context.Context, resourcePool string, fence func(string) (bool, func()), create func(string) (string, error)) (string, string, error) {
+	candidates := append([]*runPool(nil), p.pools...)
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
+	for _, pool := range candidates {
+		if resourcePool != "" && pool.resourcePool != resourcePool {
+			continue
+		}
+		reservation := pool.runs.reserve(pool)
+		if reservation == nil {
+			continue
+		}
+		defer reservation.release()
+		return pool.assignNewWithReservation(ctx, fence, create, reservation)
+	}
+	return "", "", fmt.Errorf("no runner supply in resource pool %q", resourcePool)
 }
 
 func (p *runPools) hasSupply(resourcePool string) bool {
@@ -105,8 +131,12 @@ func (r *runIndex) register(runID string, p *runPool) error {
 	if r == nil {
 		return nil
 	}
+	// Serialize durable registration and retirement, but never hold the
+	// lookup mutex across a FULL SQLite commit. An uncommitted slot is absent
+	// from every routing index and cannot be assigned or started.
+	r.retireMu.Lock()
+	defer r.retireMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.waiting == nil {
 		r.waiting = make(map[string]*runPool)
 	}
@@ -114,14 +144,18 @@ func (r *runIndex) register(runID string, p *runPool) error {
 		r.units = make(map[string]string)
 	}
 	if p.capacity != nil && r.countLocked(p) >= *p.capacity {
+		r.mu.Unlock()
 		return fmt.Errorf("runner pool %s capacity exhausted", p.name)
 	}
 	m := store.RunPoolOwnership{RunID: runID, Kind: p.kind, Pool: p.name, ResourcePool: p.resourcePool, Unit: p.unitName(runID)}
+	r.mu.Unlock()
 	if r.persist != nil {
 		if err := r.persist(m); err != nil {
 			return err
 		}
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.owners == nil {
 		r.owners = map[string]*runPool{}
 	}
@@ -342,4 +376,17 @@ func (r *runIndex) wait(ctx context.Context, runID string) (string, bool, error)
 		return "", false, fmt.Errorf("run %s is not waiting for assignment", runID)
 	}
 	return p.WaitAssignment(ctx, runID)
+}
+
+// PreparedPool returns the configured pool family for image-independent VMs.
+// Cold/restore assignments never consume these runners under a different ID.
+func (p *runPools) PreparedPool(restore ...bool) *runPools {
+	wantRestore := len(restore) > 0 && restore[0]
+	out := &runPools{}
+	for _, pool := range p.pools {
+		if pool.preparedVM && pool.preparedRestore == wantRestore {
+			out.pools = append(out.pools, pool)
+		}
+	}
+	return out
 }

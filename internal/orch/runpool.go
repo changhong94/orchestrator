@@ -13,19 +13,22 @@ import (
 )
 
 type runPool struct {
-	name         string
-	resourcePool string
-	capacity     *int
-	priority     int
-	reserved     int // guarded by runIndex.mu; includes assignments not yet enqueued
-	runs         *runIndex
-	kind         string
-	size         int
-	waitTimeout  time.Duration
-	runRoot      string
-	lc           launcher.Launcher
-	unitName     func(string) string
-	log          *slog.Logger
+	prepareConcurrency int // zero retains unbounded preparation; counts until runner ready
+	preparedRestore    bool
+	preparedVM         bool
+	name               string
+	resourcePool       string
+	capacity           *int
+	priority           int
+	reserved           int // guarded by runIndex.mu; includes assignments not yet enqueued
+	runs               *runIndex
+	kind               string
+	size               int
+	waitTimeout        time.Duration
+	runRoot            string
+	lc                 launcher.Launcher
+	unitName           func(string) string
+	log                *slog.Logger
 
 	consumeCh       chan *runConsumeReq
 	waitCh          chan *runWaitReq
@@ -41,6 +44,7 @@ type runConsumeReq struct {
 	taskID       string
 	ctx          context.Context
 	commit       func(runID string) error
+	createTask   func(runID string) (string, error)
 	sessionFence func(runID string) (bool, func())
 	reservation  *runReservation
 	resp         chan runConsumeResp
@@ -153,6 +157,34 @@ func (p *runPool) assignWithReservation(ctx context.Context, taskID string, sess
 	return res.runID, res.err
 }
 
+// AssignNew lets a prepared VM's immutable run identity participate in task
+// creation. The callback durably creates/adopts the task before the runner sees
+// its assignment. Failure quarantines the selected runner just like BindRunner;
+// no partially adopted VM can return to the idle pool.
+func (p *runPool) AssignNew(ctx context.Context, fence func(string) (bool, func()), create func(string) (string, error)) (string, string, error) {
+	return p.assignNewWithReservation(ctx, fence, create, nil)
+}
+
+func (p *runPool) assignNewWithReservation(ctx context.Context, fence func(string) (bool, func()), create func(string) (string, error), reservation *runReservation) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	if create == nil {
+		return "", "", fmt.Errorf("run pool: task creator required")
+	}
+	req := &runConsumeReq{ctx: ctx, createTask: create, sessionFence: fence, reservation: reservation, resp: make(chan runConsumeResp, 1)}
+	select {
+	case p.consumeCh <- req:
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	case <-p.done:
+		return "", "", fmt.Errorf("run pool: stopped")
+	}
+	// The actor's response is the linearization point, including cancellation.
+	res := <-req.resp
+	return req.taskID, res.runID, res.err
+}
+
 func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
@@ -225,6 +257,9 @@ func (p *runPool) loop(ctx context.Context) {
 
 	ensure := func() []string {
 		need := p.size + len(pending) - len(idle) - len(starting)
+		if p.prepareConcurrency > 0 {
+			need = min(need, p.prepareConcurrency-len(starting))
+		}
 		created := make([]string, 0, max(need, 0))
 		for ; need > 0; need-- {
 			runID, err := newRunID(p.kind)
@@ -362,7 +397,16 @@ func (p *runPool) loop(ctx context.Context) {
 					continue
 				}
 			}
-			if err := req.commit(w.runID); err != nil {
+			var commitErr error
+			if req.createTask != nil {
+				req.taskID, commitErr = req.createTask(w.runID)
+				if commitErr == nil && req.taskID == "" {
+					commitErr = fmt.Errorf("run pool: creator returned empty task identity")
+				}
+			} else {
+				commitErr = req.commit(w.runID)
+			}
+			if err := commitErr; err != nil {
 				releaseSessionFence()
 				replyConsume(req, runConsumeResp{err: err})
 				// A failed commit may already have persisted execution identity.
@@ -481,6 +525,11 @@ func (p *runPool) loop(ctx context.Context) {
 			// Give the ready worker to the oldest request before retiring this
 			// start from the finite waves of all remaining requests.
 			removeStartAttempt(req.runID, nil)
+			if p.prepareConcurrency > 0 {
+				// A successful limited wave makes progress; queued consumers may
+				// use the next wave. Failed waves retain finite failure handling.
+				addStartAttempts(pending, ensure())
+			}
 			failExhausted()
 			trimIdle()
 			ensure()

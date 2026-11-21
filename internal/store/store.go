@@ -29,11 +29,15 @@ import (
 )
 
 type Store struct {
-	db  *sql.DB
-	box *secretbox.Box
+	db           *sql.DB
+	readers      *sql.DB
+	getStmt      *sql.Stmt
+	identityStmt *sql.Stmt
+	box          *secretbox.Box
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS prepared_vm_leases (run_id TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_pool_ownership (run_id TEXT PRIMARY KEY, ownership TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_pool_pressure (name TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_recovery_placement (sandbox_id TEXT PRIMARY KEY, placement TEXT NOT NULL);
@@ -218,6 +222,7 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		"_pragma": {
 			"busy_timeout(5000)",
 			"journal_mode(WAL)",
+			"synchronous(FULL)",
 			"foreign_keys(1)",
 		},
 	}
@@ -226,6 +231,12 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
+	// SQLite has one writer. Queue this process's transactions in database/sql
+	// rather than creating competing connections which sleep in SQLite's busy
+	// handler. This also avoids reopening/configuring connections during refill.
+	// WAL + FULL still synchronizes each successful commit before acknowledgement.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	ctx := context.Background()
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
@@ -357,7 +368,35 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, box: box}, nil
+	// Short ownership reads must not queue behind refill's FULL commits.
+	// Separate read-only WAL connections observe committed snapshots only;
+	// all writes and read/modify/write transactions stay on the single writer.
+	readQuery := url.Values{"mode": {"ro"}, "_pragma": {"query_only(1)", "busy_timeout(5000)"}}
+	readDSN := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath), RawQuery: readQuery.Encode()}).String()
+	readers, err := sql.Open("sqlite", readDSN)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	readers.SetMaxOpenConns(2)
+	readers.SetMaxIdleConns(2)
+	if err = readers.PingContext(ctx); err != nil {
+		readers.Close()
+		db.Close()
+		return nil, err
+	}
+	st := &Store{db: db, readers: readers, box: box}
+	st.getStmt, err = readers.PrepareContext(ctx, `SELECT `+cols+` FROM sandboxes WHERE id=?`)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	st.identityStmt, err = readers.PrepareContext(ctx, startingTaskIdentitySQL)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	return st, nil
 }
 
 func requireColumn(ctx context.Context, db *sql.DB, table, column string) error {
@@ -411,7 +450,25 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition str
 	return nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	var err error
+	if s.getStmt != nil {
+		err = errors.Join(err, s.getStmt.Close())
+	}
+	if s.identityStmt != nil {
+		err = errors.Join(err, s.identityStmt.Close())
+	}
+	if s.readers != nil {
+		err = errors.Join(err, s.readers.Close())
+	}
+	return errors.Join(err, s.db.Close())
+}
+func (s *Store) readDB() *sql.DB {
+	if s.readers != nil {
+		return s.readers
+	}
+	return s.db
+}
 
 const (
 	secretHexLen              = sha256.Size * 2
@@ -964,13 +1021,19 @@ func (s *Store) SetStartingResourcesForRun(ctx context.Context, id, runID string
 // StartingTaskIdentity reads only the non-secret identity used to authenticate
 // a sandbox task bootstrap. It deliberately does not select or decrypt tenant
 // credentials.
+const startingTaskIdentitySQL = `SELECT run_dir FROM sandboxes WHERE id=? AND state=? AND run_id=?`
+
 func (s *Store) StartingTaskIdentity(ctx context.Context, id, runID string) (runDir string, found bool, err error) {
 	if id == "" || runID == "" {
 		return "", false, nil
 	}
-	err = s.db.QueryRowContext(ctx, `
-		SELECT run_dir FROM sandboxes
-		 WHERE id=? AND state=? AND run_id=?`, id, string(types.StateStarting), runID).Scan(&runDir)
+	var row *sql.Row
+	if s.identityStmt != nil {
+		row = s.identityStmt.QueryRowContext(ctx, id, string(types.StateStarting), runID)
+	} else {
+		row = s.readDB().QueryRowContext(ctx, startingTaskIdentitySQL, id, string(types.StateStarting), runID)
+	}
+	err = row.Scan(&runDir)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -1599,7 +1662,12 @@ func sandboxIdentityColumns(sb *types.Sandbox) (group, routeKey string, err erro
 
 // Get returns the sandbox or (nil, nil) if not found.
 func (s *Store) Get(ctx context.Context, id string) (*types.Sandbox, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+cols+` FROM sandboxes WHERE id=?`, id)
+	var row *sql.Row
+	if s.getStmt != nil {
+		row = s.getStmt.QueryRowContext(ctx, id)
+	} else {
+		row = s.readDB().QueryRowContext(ctx, `SELECT `+cols+` FROM sandboxes WHERE id=?`, id)
+	}
 	sb, err := s.scan(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -2524,7 +2592,7 @@ func (s *Store) AllowedKeyPairsByAPISecretHashPrefix(ctx context.Context, prefix
 	if len(prefix) != apiSecretCandidateHashLen || !hexCandidateHashRE.MatchString(prefix) {
 		return nil, fmt.Errorf("store: API secret hash prefix must be 24 lowercase hex characters")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.readDB().QueryContext(ctx, `
 SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys
 WHERE substr(api_secret_hash,1,24)=? AND (expires_unix=0 OR expires_unix>?)`,
 		prefix, time.Now().Unix())

@@ -16,9 +16,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -151,6 +153,7 @@ type Orchestrator struct {
 	networkGenerationBits         uint8
 	networkAttachmentSequence     uint64
 
+	preparedVMMu   sync.Mutex
 	runnerPool     *runPools
 	builderRunPool *runPools
 	runs           runIndex
@@ -276,6 +279,9 @@ func NewResolved(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs v
 					return err
 				}
 			}
+			if err := o.releasePreparedVM(context.Background(), m.RunID); err != nil {
+				return err
+			}
 			return st.DeleteRunPoolOwnership(context.Background(), m.RunID)
 		}
 	}
@@ -318,7 +324,7 @@ func (o *Orchestrator) SetResourceControllerSocketIdentity(identity string) {
 // acceptFreshLaunch is the common standalone/cluster create admission. The
 // lifecycle lock orders initial publication against a concurrent Delete; launch
 // ownership is claimed before the durable starting row becomes visible.
-func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID, initialMMDS *mmdsInitialRouteSecretValues) (*types.Sandbox, *launchAttempt, error) {
+func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID, initialMMDS *mmdsInitialRouteSecretValues, preparedRun ...string) (*types.Sandbox, *launchAttempt, error) {
 	if sb == nil || sb.State != types.StateStarting {
 		return nil, nil, fmt.Errorf("orch: fresh launch requires a starting sandbox")
 	}
@@ -331,6 +337,8 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	markAdmission, finishAdmission := admissionStageTiming("accept", sb.ID)
+	defer finishAdmission()
 	lifecycleCtx := o.launchContext()
 	if err := lifecycleCtx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("orch: lifecycle is stopping: %w", err)
@@ -350,6 +358,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		return nil, nil, err
 	}
 
+	markAdmission("prepare_launch")
 	barrierStarted := time.Now()
 	if o.routeBarriers == nil {
 		err := configsock.ErrProxyRouteUnavailable
@@ -372,7 +381,9 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		}
 	}
 
+	markAdmission("barrier_setup")
 	unlock := o.lifecycle.Lock(sb.ID)
+	markAdmission("lifecycle_lock_wait")
 	defer unlock()
 	attempt, err := o.launches.Claim(lifecycleCtx, sb.ID, launchCreate)
 	if err != nil {
@@ -387,15 +398,31 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		o.launches.Finish(attempt, err)
 		return nil, nil, err
 	}
-	if err := o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, cloneSandbox(sb), routesDigest, secretValues); err != nil {
+	markAdmission("claim_and_resource_check")
+	var adopted *store.PreparedVMLease
+	if len(preparedRun) > 0 && preparedRun[0] != "" && !preparation.Source.Empty() {
+		adopted, err = o.st.InsertSandboxWithPreparedVM(ctx, cloneSandbox(sb), routesDigest, secretValues, preparedRun[0])
+	} else {
+		err = o.st.InsertSandboxWithMMDSRouteSecretValues(ctx, cloneSandbox(sb), routesDigest, secretValues)
+	}
+	if err != nil {
 		o.launches.Finish(attempt, err)
 		return nil, nil, err
 	}
+	if adopted != nil {
+		// Ownership is durable before publication; runtime assignment still waits
+		// for the same proxy ACK barrier below. Rollback tears down this exact owner.
+		sb.RunID, sb.VswitchPort = adopted.RunID, adopted.Port
+		sb.FloatingIP, sb.InnerIP, sb.PortMAC = adopted.FloatingIP, adopted.InnerIP, adopted.MAC
+		attempt.SetRunID(adopted.RunID)
+	}
+	markAdmission("insert_durable")
 	attempt.SetAcceptedAt(time.Now())
 	initial := cloneSandbox(sb)
 	o.cache(initial)
 	o.publishUpsert(initial)
 	o.observeSandboxUpsert(initial)
+	markAdmission("publish")
 	barrierStarted = time.Now()
 	o.publishRouteBarrier(barrier.ID())
 	// The barrier is bounded by proxy policy, caller cancellation, and node
@@ -416,6 +443,7 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 			barrierErr = err
 		}
 	}
+	markAdmission("proxy_ack")
 	o.logProxyRouteBarrier(sb.ID, barrierErr, time.Since(barrierStarted))
 	if barrierErr != nil {
 		admissionErr := errors.Join(api.ErrProxyUnavailable, barrierErr)
@@ -423,6 +451,17 @@ func (o *Orchestrator) acceptFreshLaunch(ctx context.Context, sb *types.Sandbox,
 		terminalErr := errors.Join(admissionErr, rollbackErr)
 		o.launches.Finish(attempt, terminalErr)
 		return nil, nil, terminalErr
+	}
+
+	if len(preparedRun) > 0 && preparedRun[0] != "" {
+		if err := o.adoptPreparedForLaunch(ctx, sb, attempt, preparation, preparedRun[0], adopted); err != nil {
+			o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
+				return o.finishFailedPreparedAdmission(launchCtx, current, sb, err)
+			})
+			return nil, nil, err
+		}
+		markAdmission("adopt_durable")
+		initial = cloneSandbox(sb)
 	}
 	work := cloneSandbox(sb)
 	o.launches.Start(attempt, func(launchCtx context.Context, current *launchAttempt) error {
@@ -529,6 +568,7 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
 		kind = attempt.Kind()
 	}
 	o.log.Info("sandbox launch phase",
+		"pid", os.Getpid(), "end_tid", syscall.Gettid(),
 		"sid", sb.ID,
 		"run_id", sb.RunID,
 		"kind", kind,
@@ -538,6 +578,9 @@ func (o *Orchestrator) logLaunchPhase(attempt *launchAttempt, sb *types.Sandbox,
 }
 
 func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, preparation *launchPreparation) error {
+	if preparation != nil && preparation.PreparedListener != nil {
+		defer preparation.PreparedListener.Close()
+	}
 	err := o.launchSandbox(ctx, attempt, sb, tmpl, preparation)
 	result := "success"
 	failureStage := ""
@@ -553,6 +596,7 @@ func (o *Orchestrator) runLaunch(ctx context.Context, attempt *launchAttempt, sb
 		acceptedAt = time.Now()
 	}
 	o.log.Info("sandbox launch terminal",
+		"pid", os.Getpid(), "end_tid", syscall.Gettid(),
 		"sid", sb.ID,
 		"run_id", attempt.RunID(),
 		"kind", attempt.Kind(),
@@ -584,6 +628,9 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	}
 	if !preparation.Source.Empty() {
 		return o.launchArtifactSandbox(ctx, attempt, sb, tmpl, preparation)
+	}
+	if preparation.PreparedListener != nil {
+		return o.finishSandboxReadiness(ctx, attempt, sb, tmpl, preparation.PreparedListener)
 	}
 	prepareStarted := time.Now()
 	prepareLogged := false
@@ -636,7 +683,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		return launchFailed("resources", ownershipErr)
 	}
 	p := o.sandboxParams(sb, tmpl, spec, network, preparation.Resources)
-	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
+	if err := o.writeLaunchConfig(p, sb); err != nil {
 		return launchFailed("config", err)
 	}
 	readyListener, err := listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
@@ -725,6 +772,10 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 		commitFinished = assignStarted
 	}
 	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
+	return o.finishSandboxReadiness(ctx, attempt, sb, tmpl, readyListener)
+}
+
+func (o *Orchestrator) finishSandboxReadiness(ctx context.Context, attempt *launchAttempt, sb *types.Sandbox, tmpl types.TemplateID, readyListener *runtimeReadinessListener) error {
 	// Readiness and mandatory /init follow the accepted attempt owner. A
 	// positive explicitly supplied budget bounds both phases; ordinary launches
 	// have no extra overall deadline. Assignment and running TTL are separate.
@@ -735,7 +786,7 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 	}
 	defer cancelLaunch()
 	runtimeStarted := time.Now()
-	err = waitRuntimeReadiness(launchCtx, readyListener)
+	err := waitRuntimeReadiness(launchCtx, readyListener)
 	o.logLaunchPhase(attempt, sb, "runtime_ready_duration", time.Since(runtimeStarted))
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
@@ -748,9 +799,9 @@ func (o *Orchestrator) launchSandbox(ctx context.Context, attempt *launchAttempt
 			return launchFailed("envd", err)
 		}
 	}
-	unlock = o.lifecycle.Lock(sb.ID)
+	unlock := o.lifecycle.Lock(sb.ID)
 	defer unlock()
-	changed, err = o.st.CommitStartingRunning(ctx, sb.ID, sb.RunID)
+	changed, err := o.st.CommitStartingRunning(ctx, sb.ID, sb.RunID)
 	if err != nil {
 		return launchFailed("commit", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
 	}
@@ -2198,12 +2249,13 @@ func (o *Orchestrator) waitLaunchState(ctx context.Context, sid string) (*types.
 // acceptance. It is built before route publication, network attach, resource
 // controller admission, cgroup creation, or runner assignment.
 type launchPreparation struct {
-	Placement *nodectl.Placement
-	Prepared  *configsock.ArtifactPrepareSummary
-	Spec      sandboxcfg.SandboxSpec
-	Source    types.ResumeSource
-	Network   sandboxcfg.NetworkSpec
-	Resources rtconfig.ResourcesConfig
+	PreparedListener *runtimeReadinessListener
+	Placement        *nodectl.Placement
+	Prepared         *configsock.ArtifactPrepareSummary
+	Spec             sandboxcfg.SandboxSpec
+	Source           types.ResumeSource
+	Network          sandboxcfg.NetworkSpec
+	Resources        rtconfig.ResourcesConfig
 }
 
 func (o *Orchestrator) prepareSandboxLaunch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) (*launchPreparation, error) {
@@ -2496,7 +2548,7 @@ func (o *Orchestrator) SandboxTaskSpecFor(ctx context.Context, sandboxID, runID 
 		response.Prepare.SBXCreateWorkspaces = sb.WorkspacePlan
 		response.Prepare.SBXCreateMounts = cfgSpec.Mounts
 	}
-	if sb.ResumeSource.Empty() && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory {
+	if sb.ResumeSource.Empty() && sb.Metadata[nativeForkParentKey] == "" && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory {
 		runtimePath, err := filepath.Abs(o.runtimeFileFor(tmpl.Profile))
 		if err != nil {
 			return nil, false, fmt.Errorf("orch: absolute runtime path: %w", err)
@@ -2530,7 +2582,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	if !ok || attempt.RunID() != runID {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
-	sb, err := o.st.Get(ctx, sandboxID)
+	sb, err := o.st.GetLaunchIdentity(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -2556,7 +2608,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	if err != nil {
 		return nil, err
 	}
-	current, err := o.st.Get(ctx, sandboxID)
+	current, err := o.st.GetLaunchIdentity(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -2611,11 +2663,30 @@ func (o *Orchestrator) sandboxFinalLaunchSpec(sb *types.Sandbox, tmpl types.Temp
 		"--stderr-to", sandboxJournalTarget(configsock.RunnerLogTag, sb),
 		"--console", sandboxJournalTarget(configsock.ConsoleTag, sb),
 	}
+	if o.cfg.Sandbox.PrivateRAMFork && sb.ResumeSource.Empty() {
+		if parent := sb.Metadata[nativeForkParentKey]; parent != "" {
+			port, _ := strconv.Atoi(sb.VswitchPort)
+			args = append(args, "--native-fork-parent", parent, "--native-child-cid", strconv.Itoa(1024+port))
+		} else {
+			args = append(args, "--private-ram-fork")
+		}
+	}
+	// A fresh identity restored from any reusable memory template is a clone.
+	// Do not rely on caller-supplied metadata to enable its isolation barrier.
+	if sb.ResumeSource.Empty() && sb.Metadata[nativeForkParentKey] == "" && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory {
+		args = append(args, "--fork-identity")
+	}
 	args = appendRefLocationArgs(args, locations)
 	for _, c := range p.ConnectSpecs() {
 		args = append(args, "--connect", c)
 	}
-	return &configsock.LaunchSpec{
+	var env map[string]string
+	if o.inlineRestoreEnvd(sb, tmpl) {
+		payload, _ := json.Marshal(map[string]any{"envVars": sb.Env, "defaultUser": "user", "defaultWorkdir": "/home/user", "timestamp": time.Now().UTC().Format(time.RFC3339Nano)})
+		env = map[string]string{"KUASAR_RESTORE_ENVD_INIT": string(payload), "KUASAR_RESTORE_ENVD_SOCKET": sb.EnvdUDS}
+		args = append(args, "--restore-envd-init")
+	}
+	return &configsock.LaunchSpec{Env: env,
 		Exec:    o.executables.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
@@ -3426,4 +3497,10 @@ func (o *Orchestrator) profileNet(p types.Profile) config.ProfileNet {
 		return o.cfg.Sandbox.Network.Bare
 	}
 	return o.cfg.Sandbox.Network.E2B
+}
+
+// Explicitly enabled only with a compatible sandbox-ctl. Older guest snapshots
+// retain the host-side /init fallback; MMDS rekeying keeps its existing path.
+func (o *Orchestrator) inlineRestoreEnvd(sb *types.Sandbox, tmpl types.TemplateID) bool {
+	return o.cfg.Sandbox.RestoreEnvdInit && !o.cfg.MMDS.Enabled && tmpl.Profile == types.ProfileE2B && tmpl.Kind == types.KindSnp && sb.LaunchMode == types.LaunchMemory && sb.Metadata[nativeForkParentKey] == ""
 }

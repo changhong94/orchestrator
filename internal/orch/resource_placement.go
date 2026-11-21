@@ -163,6 +163,12 @@ func (o *Orchestrator) restoreResourcePlacements(ctx context.Context, state *nod
 			}
 		}
 		if actual, ok := live[m.RunID]; !ok {
+			// The exact persisted unit is stopped. Release its prepared
+			// network lease before deleting the recovery ownership, just as
+			// normal runner retirement does. A failed detach remains retryable.
+			if err := o.releasePreparedVM(ctx, m.RunID); err != nil {
+				return err
+			}
 			if err := o.st.DeleteRunPoolOwnership(ctx, m.RunID); err != nil {
 				return err
 			}

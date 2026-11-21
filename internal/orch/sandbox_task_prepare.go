@@ -17,6 +17,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
@@ -69,65 +70,70 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	// The listener exists before assignment becomes visible. node-ctl connects
 	// immediately after WaitAssignment, making a task exit during root reading an
 	// observable EOF instead of a launch-wide timeout.
-	readyListener, err := listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
-	if err != nil {
-		return launchFailed("artifact_prepare", err)
+	readyListener := preparation.PreparedListener
+	var err error
+	if readyListener == nil {
+		readyListener, err = listenRuntimeReadiness(o.cfg.Paths.RunRoot, sb.ID)
+		if err != nil {
+			return launchFailed("artifact_prepare", err)
+		}
+
+		assignStarted := time.Now()
+		assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
+		var commitStarted, commitFinished time.Time
+		resourcePool := ""
+		if preparation.Placement != nil {
+			resourcePool = preparation.Placement.Pool
+		}
+		runID, err := o.runnerPool.assignInResourcePool(assignmentCtx, resourcePool, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
+			commitStarted = time.Now()
+			unlock := o.lifecycle.Lock(sb.ID)
+			defer unlock()
+			changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				return errLaunchOwnershipLost
+			}
+			if o.sandboxReadyTimeout > 0 && attempt.Deadline().IsZero() {
+				attempt.SetDeadline(time.Now().Add(o.sandboxReadyTimeout))
+			}
+			sb.RunID = runID
+			attempt.SetRunID(runID)
+			bound := o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
+			if bound == nil {
+				bound = cloneSandbox(sb)
+				o.cache(bound)
+			}
+			o.publishUpsert(bound)
+			o.observeSandboxUpsert(bound)
+			commitFinished = time.Now()
+			return nil
+		})
+		cancelAssignment()
+		waitFinished := time.Now()
+		if !commitStarted.IsZero() {
+			waitFinished = commitStarted
+		}
+		o.logLaunchPhase(attempt, sb, "runner_wait_duration", waitFinished.Sub(assignStarted))
+		if !commitStarted.IsZero() {
+			if commitFinished.IsZero() {
+				commitFinished = time.Now()
+			}
+			o.logLaunchPhase(attempt, sb, "runner_commit_duration", commitFinished.Sub(commitStarted))
+		}
+		if err != nil {
+			return launchFailed("artifact_prepare", err)
+		}
+		if sb.RunID == "" {
+			sb.RunID = runID
+			attempt.SetRunID(runID)
+		}
+		o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
+
 	}
 	defer readyListener.Close()
-
-	assignStarted := time.Now()
-	assignmentCtx, cancelAssignment := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
-	var commitStarted, commitFinished time.Time
-	resourcePool := ""
-	if preparation.Placement != nil {
-		resourcePool = preparation.Placement.Pool
-	}
-	runID, err := o.runnerPool.assignInResourcePool(assignmentCtx, resourcePool, sb.ID, func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) error {
-		commitStarted = time.Now()
-		unlock := o.lifecycle.Lock(sb.ID)
-		defer unlock()
-		changed, err := o.st.BindStartingRunner(ctx, sb.ID, runID)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return errLaunchOwnershipLost
-		}
-		if o.sandboxReadyTimeout > 0 && attempt.Deadline().IsZero() {
-			attempt.SetDeadline(time.Now().Add(o.sandboxReadyTimeout))
-		}
-		sb.RunID = runID
-		attempt.SetRunID(runID)
-		bound := o.mutateCached(sb.ID, func(cached *types.Sandbox) { cached.RunID = runID })
-		if bound == nil {
-			bound = cloneSandbox(sb)
-			o.cache(bound)
-		}
-		o.publishUpsert(bound)
-		o.observeSandboxUpsert(bound)
-		commitFinished = time.Now()
-		return nil
-	})
-	cancelAssignment()
-	waitFinished := time.Now()
-	if !commitStarted.IsZero() {
-		waitFinished = commitStarted
-	}
-	o.logLaunchPhase(attempt, sb, "runner_wait_duration", waitFinished.Sub(assignStarted))
-	if !commitStarted.IsZero() {
-		if commitFinished.IsZero() {
-			commitFinished = time.Now()
-		}
-		o.logLaunchPhase(attempt, sb, "runner_commit_duration", commitFinished.Sub(commitStarted))
-	}
-	if err != nil {
-		return launchFailed("artifact_prepare", err)
-	}
-	if sb.RunID == "" {
-		sb.RunID = runID
-		attempt.SetRunID(runID)
-	}
-	o.logLaunchPhase(attempt, sb, "runner_handoff_duration", time.Since(commitFinished))
 
 	launchCtx, cancelLaunch := context.WithCancel(ctx)
 	if deadline := attempt.Deadline(); !deadline.IsZero() {
@@ -323,7 +329,15 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		return launchFailed("resource_resolve", err)
 	}
 
-	port, err := o.attachNetwork(launchCtx, network)
+	var port *vswitch.Port
+	if preparation.PreparedListener != nil {
+		if sb.VswitchPort == "" || sb.InnerIP != network.InnerIP {
+			return launchFailed("network_attach", errors.New("prepared network does not match workload network"))
+		}
+		port = &vswitch.Port{Port: sb.VswitchPort, FloatingIP: sb.FloatingIP, MAC: sb.PortMAC, InnerIP: sb.InnerIP}
+	} else {
+		port, err = o.attachNetwork(launchCtx, network)
+	}
 	if err != nil {
 		return launchFailed("network_attach", err)
 	}
@@ -332,30 +346,41 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		FloatingIP: sb.FloatingIP, VswitchPort: sb.VswitchPort, InnerIP: sb.InnerIP, PortMAC: sb.PortMAC,
 	}
 
+	networkCommitFailure := func(cause error) error {
+		if preparation.PreparedListener != nil {
+			return cause
+		} // already durable; rollback fences the VM first
+		return o.detachUncommittedLaunchPort(sb, port.Port, cause)
+	}
 	// Serialize exact ownership commit, YAML publication, and route publication
 	// with Delete/Kill. If the lifecycle fence was lost, detach the uncommitted
 	// port immediately; rollback retains it only when that detach itself fails.
 	unlock := o.lifecycle.Lock(sb.ID)
 	if err := launchCtx.Err(); err != nil {
 		unlock()
-		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
+		return launchFailed("network_commit", networkCommitFailure(err))
 	}
-	current, err := o.st.Get(launchCtx, sb.ID)
+	current, err := o.st.GetLaunchIdentity(launchCtx, sb.ID)
 	if err != nil || current == nil || current.State != types.StateStarting || current.RunID != sb.RunID ||
 		current.LaunchMode != sb.LaunchMode || current.ResumeSource != sb.ResumeSource || current.TemplateID != sb.TemplateID || current.CreatedUnix != sb.CreatedUnix {
 		if err == nil {
 			err = errLaunchOwnershipLost
 		}
 		unlock()
-		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
+		return launchFailed("network_commit", networkCommitFailure(err))
 	}
-	changed, err := o.st.SetStartingResourcesForRun(launchCtx, sb.ID, sb.RunID, resourcesOwned)
+	changed := false
+	if preparation.PreparedListener != nil {
+		changed = current.VswitchPort == sb.VswitchPort && current.PortMAC == sb.PortMAC && current.FloatingIP == sb.FloatingIP && current.InnerIP == sb.InnerIP
+	} else {
+		changed, err = o.st.SetStartingResourcesForRun(launchCtx, sb.ID, sb.RunID, resourcesOwned)
+	}
 	if err != nil || !changed {
 		if err == nil {
 			err = errLaunchOwnershipLost
 		}
 		unlock()
-		return launchFailed("network_commit", o.detachUncommittedLaunchPort(sb, port.Port, err))
+		return launchFailed("network_commit", networkCommitFailure(err))
 	}
 	p := o.sandboxParams(sb, tmpl, preparation.Spec, network, resources)
 	p.ArtifactDisks = effectiveDisks
@@ -402,7 +427,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 			return launchFailed("workspace_attach", err)
 		}
 	}
-	if tmpl.Profile == types.ProfileE2B {
+	if tmpl.Profile == types.ProfileE2B && !o.inlineRestoreEnvd(sb, tmpl) {
 		envdStarted := time.Now()
 		err = o.envdInit(launchCtx, sb)
 		o.logLaunchPhase(attempt, sb, "envd_init_duration", time.Since(envdStarted))

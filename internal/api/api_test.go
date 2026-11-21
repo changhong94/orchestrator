@@ -1567,7 +1567,7 @@ func TestCreateExecSessionSanitizesOperationalFailuresAsUnavailable(t *testing.T
 				if response.Code != http.StatusServiceUnavailable {
 					t.Fatalf("migration=%t status = %d, want 503; body=%s", migrationToken != "", response.Code, response.Body.String())
 				}
-				if got := response.Body.String(); got != "{\"message\":\"exec session unavailable\"}\n" {
+				if got := response.Body.String(); got != "{\"code\":503,\"message\":\"exec session unavailable\"}\n" {
 					t.Fatalf("public response = %q, want fixed unavailable error", got)
 				}
 			}
@@ -1886,7 +1886,7 @@ func TestFailMapsProxyUnavailableToServiceUnavailable(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", response.Code)
 	}
-	if got := response.Body.String(); got != "{\"message\":\"proxy temporarily unavailable\"}\n" {
+	if got := response.Body.String(); got != "{\"code\":503,\"message\":\"proxy temporarily unavailable\"}\n" {
 		t.Fatalf("public response = %q", got)
 	}
 }
@@ -1907,7 +1907,7 @@ func TestFailMapsExtensionErrorsWithoutLeakingDetails(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			response := httptest.NewRecorder()
 			a.fail(response, test.err)
-			if response.Code != test.status || response.Body.String() != "{\"message\":\""+test.body+"\"}\n" {
+			if response.Code != test.status || response.Body.String() != fmt.Sprintf("{\"code\":%d,\"message\":%q}\n", test.status, test.body) {
 				t.Fatalf("response = %d %q", response.Code, response.Body.String())
 			}
 		})
@@ -1918,7 +1918,7 @@ func TestFailExecSessionMapsStaleExtensionResult(t *testing.T) {
 	a := &API{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	response := httptest.NewRecorder()
 	a.failExecSession(response, errors.Join(ErrSandboxChanged, errors.New("private incarnation detail")))
-	if response.Code != http.StatusConflict || response.Body.String() != "{\"message\":\""+ErrSandboxChanged.Error()+"\"}\n" {
+	if response.Code != http.StatusConflict || response.Body.String() != "{\"code\":409,\"message\":\""+ErrSandboxChanged.Error()+"\"}\n" {
 		t.Fatalf("response = %d %q", response.Code, response.Body.String())
 	}
 }

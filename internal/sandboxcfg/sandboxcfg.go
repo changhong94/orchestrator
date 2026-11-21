@@ -52,7 +52,8 @@ type NetworkSpec struct {
 
 // RestoreSpec is the tenant-selectable restore prefetch request.
 type RestoreSpec struct {
-	Prefetch string `json:"prefetch,omitempty"`
+	ForkIdentity bool   `json:"fork_identity,omitempty"`
+	Prefetch     string `json:"prefetch,omitempty"`
 }
 
 // TapFD is the node-managed tapfd transport rendered into runtime config.
@@ -212,8 +213,13 @@ func parseRestore(raw string) (RestoreSpec, error) {
 		return restore, fmt.Errorf("sandboxcfg: metadata[%q] is not a valid JSON object: %w", NsRestore, err)
 	}
 	for field := range object {
-		if field != "prefetch" {
+		if field != "prefetch" && field != "fork_identity" {
 			return restore, fmt.Errorf("sandboxcfg: metadata[%q] contains unknown field %q", NsRestore, field)
+		}
+	}
+	if raw, exists := object["fork_identity"]; exists {
+		if string(raw) == "null" || json.Unmarshal(raw, &restore.ForkIdentity) != nil {
+			return restore, fmt.Errorf("sandboxcfg: fork_identity must be boolean")
 		}
 	}
 	prefetch, ok := object["prefetch"]
@@ -929,4 +935,16 @@ func (p Params) ConnectSpecs() []string {
 		p.Sandbox.EnvdUDS + ":127.0.0.1:49983",
 		p.Sandbox.CiUDS + ":127.0.0.1:49999",
 	}
+}
+
+// BuildForkHostConfig binds only the new owner's host resources and network.
+// RAM, disk graph and workload are inherited from the running source.
+func (p Params) BuildForkHostConfig() (*SnapshotHostConfig, error) {
+	usage, err := p.runtimeUsage()
+	if err != nil {
+		return nil, err
+	}
+	resources := p.Resources
+	resources.DiffCOW.Discard = ""
+	return &SnapshotHostConfig{Resources: resources, Timeouts: p.Timeouts, Usage: usage, Network: p.buildRuntimeNetwork(), Boot: hostBootConfig{Runtime: "file://" + p.Runtime}}, nil
 }

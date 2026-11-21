@@ -44,7 +44,7 @@ func TestStandaloneConnectMapsProxyUnavailableWithAndWithoutMigrationToken(t *te
 			if response.Code != http.StatusServiceUnavailable {
 				t.Fatalf("status=%d, want 503; body=%s", response.Code, response.Body.String())
 			}
-			if got := response.Body.String(); got != "{\"message\":\"proxy temporarily unavailable\"}\n" {
+			if got := response.Body.String(); got != "{\"code\":503,\"message\":\"proxy temporarily unavailable\"}\n" {
 				t.Fatalf("public response=%q", got)
 			}
 		})

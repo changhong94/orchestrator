@@ -498,8 +498,11 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v2/sandboxes", a.auth(a.list))
 	mux.HandleFunc("DELETE /sandboxes/{id}", a.auth(a.kill))
 	mux.HandleFunc("POST /sandboxes/{id}/connect", a.auth(a.connect))
+	mux.HandleFunc("POST /v2/sandboxes/{id}/connect", a.auth(a.connect))
 	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.authAPIKey(a.execSession))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", a.auth(a.pause))
+	mux.HandleFunc("POST /sandboxes/{id}/fork", a.auth(a.forkSandbox))
+	mux.HandleFunc("POST /sandboxes/{id}/snapshots", a.auth(a.snapshotRunningSandbox))
 	mux.HandleFunc("POST /sandboxes/{id}/reset", a.auth(a.reset))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", a.auth(a.timeout))
 	// Template build (e2b v3). The CLI authenticates with a Bearer access token;
@@ -1590,7 +1593,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"message": msg})
+	writeJSON(w, code, map[string]any{"code": code, "message": msg})
 }
 
 func atoiDefault(s string, def int) int {

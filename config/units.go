@@ -12,21 +12,27 @@ import (
 // RunPoolConfig is one independent pool. Size is an idle target, not execution
 // capacity or selection weight. Repeated entries are intentional.
 type RunPoolConfig struct {
-	Unit         string `yaml:"unit" json:"unit"`
-	Size         int    `yaml:"size" json:"size"`
-	Name         string `yaml:"name,omitempty" json:"name,omitempty"`
-	ResourcePool string `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
-	Capacity     *int   `yaml:"capacity,omitempty" json:"capacity,omitempty"`
-	Priority     int    `yaml:"priority,omitempty" json:"priority,omitempty"`
+	PrepareConcurrency int    `yaml:"prepare_concurrency,omitempty" json:"prepare_concurrency,omitempty"`
+	PreparedRestore    bool   `yaml:"prepared_restore,omitempty" json:"prepared_restore,omitempty"`
+	PreparedVM         bool   `yaml:"prepared_vm,omitempty" json:"prepared_vm,omitempty"`
+	Unit               string `yaml:"unit" json:"unit"`
+	Size               int    `yaml:"size" json:"size"`
+	Name               string `yaml:"name,omitempty" json:"name,omitempty"`
+	ResourcePool       string `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
+	Capacity           *int   `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	Priority           int    `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
 type runPoolInput struct {
-	Unit         *string `yaml:"unit" json:"unit"`
-	Size         *int    `yaml:"size" json:"size"`
-	Name         string  `yaml:"name,omitempty" json:"name,omitempty"`
-	ResourcePool string  `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
-	Capacity     *int    `yaml:"capacity,omitempty" json:"capacity,omitempty"`
-	Priority     int     `yaml:"priority,omitempty" json:"priority,omitempty"`
+	PrepareConcurrency int     `yaml:"prepare_concurrency,omitempty" json:"prepare_concurrency,omitempty"`
+	PreparedRestore    bool    `yaml:"prepared_restore,omitempty" json:"prepared_restore,omitempty"`
+	PreparedVM         bool    `yaml:"prepared_vm,omitempty" json:"prepared_vm,omitempty"`
+	Unit               *string `yaml:"unit" json:"unit"`
+	Size               *int    `yaml:"size" json:"size"`
+	Name               string  `yaml:"name,omitempty" json:"name,omitempty"`
+	ResourcePool       string  `yaml:"resource_pool,omitempty" json:"resource_pool,omitempty"`
+	Capacity           *int    `yaml:"capacity,omitempty" json:"capacity,omitempty"`
+	Priority           int     `yaml:"priority,omitempty" json:"priority,omitempty"`
 }
 
 func (p *RunPoolConfig) decode(in runPoolInput) error {
@@ -34,6 +40,15 @@ func (p *RunPoolConfig) decode(in runPoolInput) error {
 		return fmt.Errorf("config: pool requires unit and size")
 	}
 	p.Unit, p.Size = *in.Unit, *in.Size
+	if in.PrepareConcurrency < 0 {
+		return fmt.Errorf("config: prepare_concurrency must be nonnegative")
+	}
+	p.PrepareConcurrency = in.PrepareConcurrency
+	p.PreparedVM = in.PreparedVM
+	p.PreparedRestore = in.PreparedRestore
+	if p.PreparedRestore && !p.PreparedVM {
+		return fmt.Errorf("config: prepared_restore requires prepared_vm")
+	}
 	p.Name, p.ResourcePool, p.Capacity, p.Priority = in.Name, in.ResourcePool, in.Capacity, in.Priority
 	return nil
 }
@@ -44,7 +59,7 @@ func (p *RunPoolConfig) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	for key := range fields {
-		if key != "unit" && key != "size" && key != "name" && key != "resource_pool" && key != "capacity" && key != "priority" {
+		if key != "unit" && key != "size" && key != "name" && key != "resource_pool" && key != "capacity" && key != "priority" && key != "prepared_restore" && key != "prepared_vm" && key != "prepare_concurrency" {
 			return fmt.Errorf("config: pool contains unknown field %q", key)
 		}
 	}
@@ -135,6 +150,9 @@ func (u UnitsConfig) validate() error {
 			return fmt.Errorf("config: units.%s_pools must not be empty", kind.name)
 		}
 		for i, pool := range kind.pools {
+			if pool.PreparedVM && kind.name != "runner" {
+				return fmt.Errorf("config: prepared_vm is only valid for runner pools")
+			}
 			if !serviceTemplate.MatchString(pool.Unit) {
 				return fmt.Errorf("config: units.%s_pools[%d].unit must be a service template name (name@.service)", kind.name, i)
 			}
@@ -145,6 +163,17 @@ func (u UnitsConfig) validate() error {
 				return fmt.Errorf("config: units.%s_pools[%d] requires 0 <= size <= capacity", kind.name, i)
 			}
 		}
+	}
+	prepared, cold := false, false
+	for _, pool := range u.RunnerPoolConfigs() {
+		if pool.PreparedVM {
+			prepared = true
+		} else {
+			cold = true
+		}
+	}
+	if prepared && !cold {
+		return fmt.Errorf("config: prepared VM pools require an ordinary runner pool for restore and incompatible requests")
 	}
 	return nil
 }

@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -34,16 +33,30 @@ func runSandbox(args []string, log *slog.Logger) error {
 	if *pidfile == "" || *socket == "" || *runID == "" {
 		return fmt.Errorf("run-sandbox: --pidfile, --config-socket, and --run-id required")
 	}
+	var prepared *preparedSandboxChild
+	var bootstrap *configsock.SandboxTaskSpec
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
-		lockPidfile:    lockPidfile,
-		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
-		openSession:    openRunSessionKeeper,
-		waitAssignment: configsock.WaitAssignment,
-		connectReady:   connectReadinessSocket,
+		prepareVM: func(socket, runID string, cgroup *os.File) (*preparedSandboxChild, error) {
+			var err error
+			prepared, err = startPreparedSandbox(socket, runID, cgroup)
+			return prepared, err
+		},
+		lockPidfile:   lockPidfile,
+		prepareCgroup: func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
+		openSession:   openRunSessionKeeper,
+		waitAssignment: func(ctx context.Context, socket, kind, runID string) (string, error) {
+			out, err := configsock.WaitSandboxBootstrap(ctx, socket, runID)
+			if err != nil {
+				return "", err
+			}
+			bootstrap = out.Bootstrap
+			return out.TaskID, nil
+		},
+		connectReady: connectReadinessSocket,
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
-			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log)
+			return launchTaskWithBootstrap(ctx, stop, socket, sid, runID, ready, cgroup, log, bootstrap, prepared)
 		},
 	})
 }
@@ -55,6 +68,7 @@ func openRunSessionKeeper(ctx context.Context, socket, kind, runID string) (runS
 }
 
 type runSandboxOps struct {
+	prepareVM      func(string, string, *os.File) (*preparedSandboxChild, error)
 	lockPidfile    func(string) error
 	prepareCgroup  func() (*os.File, error)
 	openSession    func(context.Context, string, string, string) (runSessionCloser, error)
@@ -79,10 +93,30 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 		}
 		defer session.Close()
 	}
-	sid, err := waitSandboxAssignmentWithRetry(context.Background(), socket, runID, ops.waitAssignment)
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	defer cancelWait()
+	if ops.prepareVM != nil {
+		prepared, err := ops.prepareVM(socket, runID, vmmCgroup)
+		if err != nil {
+			return err
+		}
+		if prepared != nil {
+			defer prepared.Close()
+			go func() {
+				select {
+				case <-prepared.done:
+					cancelWait()
+				case <-waitCtx.Done():
+				}
+			}()
+		}
+	}
+	sid, err := waitSandboxAssignmentWithRetry(waitCtx, socket, runID, ops.waitAssignment)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
+	assignedAt := time.Now()
+	assignedTID := syscall.Gettid()
 	runRoot := filepath.Dir(filepath.Dir(pidfile))
 	ready, err := ops.connectReady(configsock.ReadinessSocketPath(runRoot, sid))
 	if err != nil {
@@ -92,6 +126,9 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 	// chdir, argv, or Start failure returns through this defer and turns into EOF
 	// for the orchestrator instead of making it wait for the launch timeout.
 	defer ready.Close()
+	if os.Getenv("CH_FORK_TIMING") != "" {
+		fmt.Fprintf(os.Stderr, "ASSIGNMENT_READY run_id=%s assigned_ns=%d ready_ns=%d pid=%d assigned_tid=%d ready_tid=%d\n", runID, assignedAt.UnixNano(), time.Now().UnixNano(), os.Getpid(), assignedTID, syscall.Gettid())
+	}
 	return ops.launchTask(socket, sid, runID, ready, vmmCgroup)
 }
 
@@ -124,26 +161,16 @@ func waitSandboxAssignmentWithRetry(ctx context.Context, socket, runID string, w
 }
 
 func connectReadinessSocket(path string) (*os.File, error) {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	// The caller needs an owned file descriptor, not a netpoll connection. Create
+	// it close-on-exec atomically instead of registering, duplicating, and closing
+	// a temporary net.UnixConn. Child inheritance remains owned by Start.
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create readiness socket: %w", err)
 	}
-	f, err := conn.File()
-	_ = conn.Close()
-	if err != nil {
-		return nil, err
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("connect readiness socket: %w", err)
 	}
-	// File returns a duplicate. Keep it close-on-exec throughout every fallible
-	// preparation step. sandboxproc.Start explicitly passes the child copy;
-	// the parent descriptor never needs to become inheritable.
-	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("get readiness fd flags: %w", err)
-	}
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, flags|unix.FD_CLOEXEC); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("set readiness fd close-on-exec: %w", err)
-	}
-	return f, nil
+	return os.NewFile(uintptr(fd), "readiness-socket"), nil
 }
