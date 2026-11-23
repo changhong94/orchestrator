@@ -34,6 +34,7 @@ type Store struct {
 }
 
 const schema = `
+CREATE TABLE IF NOT EXISTS prepared_vm_leases (run_id TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_pool_ownership (run_id TEXT PRIMARY KEY, ownership TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_pool_pressure (name TEXT PRIMARY KEY, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS resource_recovery_placement (sandbox_id TEXT PRIMARY KEY, placement TEXT NOT NULL);

@@ -445,14 +445,15 @@ func (u UnitsConfig) PoolWaitDuration() time.Duration {
 
 // SandboxConfig is the sandbox-instance defaults, sub-grouped for clarity.
 type SandboxConfig struct {
-	TimeoutSec int                   `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
-	DeadTTL    string                `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
-	Capacity   int                   `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator; docs/cluster.md#placer-placement); 0 = unbounded
-	Resources  ResourcesConfig       `yaml:"resources" json:"resources"`     // capacity + resource control
-	Timeouts   SandboxTimeoutsConfig `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
-	Usage      UsageConfig           `yaml:"usage" json:"usage"`     // node-local native accounting policy
-	Network    NetworkConfig         `yaml:"network" json:"network"` // vswitch + inner IP
-	Boot       BootConfig            `yaml:"boot" json:"boot"`       // boot artifacts (kernel / guest runtime / overlay)
+	PrivateRAMFork bool                  `yaml:"private_ram_fork" json:"private_ram_fork"`
+	TimeoutSec     int                   `yaml:"timeout_sec" json:"timeout_sec"` // default TTL; default 300
+	DeadTTL        string                `yaml:"dead_ttl" json:"dead_ttl"`       // diagnostic dead-row retention; default 24h
+	Capacity       int                   `yaml:"capacity" json:"capacity"`       // max sandboxes this node admits (cluster headroom denominator; docs/cluster.md#placer-placement); 0 = unbounded
+	Resources      ResourcesConfig       `yaml:"resources" json:"resources"`     // capacity + resource control
+	Timeouts       SandboxTimeoutsConfig `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
+	Usage          UsageConfig           `yaml:"usage" json:"usage"`     // node-local native accounting policy
+	Network        NetworkConfig         `yaml:"network" json:"network"` // vswitch + inner IP
+	Boot           BootConfig            `yaml:"boot" json:"boot"`       // boot artifacts (kernel / guest runtime / overlay)
 }
 
 func (s SandboxConfig) DeadTTLDur() time.Duration {
@@ -1255,6 +1256,11 @@ func (c *Conductor) validateDeclarative() error {
 		}
 		if validity <= 0 {
 			return fmt.Errorf("config: builder.referer.validity must be positive")
+		}
+	}
+	for _, pool := range c.Units.RunnerPoolConfigs() {
+		if pool.PreparedVM && c.ResourceListen != nil && c.ResourceListen.Enabled {
+			return fmt.Errorf("config: prepared_vm currently requires static resource policy")
 		}
 	}
 	if err := c.Units.validate(); err != nil {

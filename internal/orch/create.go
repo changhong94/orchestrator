@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +19,9 @@ import (
 )
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
+	if _, ok := req.Metadata[nativeForkParentKey]; ok {
+		return nil, fmt.Errorf("%w: native fork lineage is host owned", api.ErrBadRequest)
+	}
 	if err := types.ValidateIdleTimeout(req.IdleTimeout); err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -46,6 +50,36 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	tmpl, normalized, mmdsDoc, err := o.normalizeSandboxCreateDefinition(ctx, req.APIKey, req.TemplateID, req.Metadata, req.MMDSHeader)
 	if err != nil {
 		return nil, err
+	}
+
+	poolSpec, err := sandboxcfg.ParseSpec(normalized.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	poolNetworkCompatible := reflect.DeepEqual(poolSpec.Network, sandboxcfg.NetworkSpec{})
+	// A prepared VM already has its immutable runtime identity. Choose it before
+	// fresh admission, then durably transfer the network lease before assignment.
+	if poolNetworkCompatible && o.runnerPool != nil && identity.ID == "" && identity.StableID == "" && (tmpl.Kind == types.KindSbx || tmpl.Kind == types.KindImg) && tmpl.Profile == types.ProfileE2B && o.extensionSandboxHook == nil && len(req.Workspaces) == 0 {
+		pools := o.runnerPool.PreparedPool()
+		if len(pools.pools) > 0 {
+			var accepted *types.Sandbox
+			var attempt *launchAttempt
+			claimCtx, cancel := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
+			defer cancel()
+			_, _, err := pools.AssignNew(claimCtx, "", func(run string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, run) }, func(run string) (string, error) {
+				var err error
+				accepted, attempt, err = o.acceptSandboxCreate(claimCtx, sandboxCreateSpec{ID: run, PreparedRun: run, Template: tmpl, Pair: pair, Config: normalized, Env: req.EnvVars, TimeoutSeconds: req.TimeoutSec, IdleTimeout: types.CloneIdleTimeout(req.IdleTimeout), AutoPauseMemory: req.AutoPauseMemory, AutoReset: req.AutoReset, InitialMMDS: initialMMDSRouteSecretValues(mmdsDoc)})
+				if err != nil {
+					return "", err
+				}
+				return run, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			o.logLaunchPhase(attempt, accepted, "admission_duration", time.Since(admissionStarted))
+			return cloneSandbox(accepted), nil
+		}
 	}
 	sid := identity.ID
 	if sid == "" {
@@ -137,6 +171,9 @@ type sandboxCreateConfig struct {
 }
 
 func (o *Orchestrator) normalizeSandboxCreateConfig(profile types.Profile, metadata map[string]string) (sandboxCreateConfig, error) {
+	if _, ok := metadata[nativeForkParentKey]; ok {
+		return sandboxCreateConfig{}, fmt.Errorf("%w: native fork lineage is host owned", api.ErrBadRequest)
+	}
 	if _, present := metadata[sandboxcfg.NsIdentity]; present {
 		return sandboxCreateConfig{}, fmt.Errorf("%w: %s cannot override core-owned sandbox identity", api.ErrBadRequest, sandboxcfg.NsIdentity)
 	}
@@ -180,6 +217,8 @@ func (o *Orchestrator) normalizeSandboxCreateConfig(profile types.Profile, metad
 // sandboxCreateSpec has already-selected identity and validated configuration.
 // It is not a wire schema or another public configuration surface.
 type sandboxCreateSpec struct {
+	NativeParent    string
+	PreparedRun     string
 	ID              string
 	StableID        string
 	Cluster         *types.ClusterSandboxContext
@@ -220,6 +259,12 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 		Metadata: cloneStringMap(spec.Config.Metadata), Env: cloneStringMap(spec.Env),
 		CreatedUnix: now.Unix(), DeadlineUnix: now.Add(time.Duration(spec.TimeoutSeconds) * time.Second).Unix(),
 	}
+	if spec.NativeParent != "" {
+		if sb.Metadata == nil {
+			sb.Metadata = map[string]string{}
+		}
+		sb.Metadata[nativeForkParentKey] = spec.NativeParent
+	}
 	if err := o.prepareCreateWorkspaces(ctx, sb, spec.Config.Workspaces, spec.Template.Kind == types.KindImg); err != nil {
 		return nil, nil, err
 	}
@@ -235,7 +280,7 @@ func (o *Orchestrator) acceptSandboxCreate(ctx context.Context, spec sandboxCrea
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, spec.Template, spec.InitialMMDS)
+	accepted, attempt, err := o.acceptFreshLaunch(ctx, sb, spec.Template, spec.InitialMMDS, spec.PreparedRun)
 	if errors.Is(err, errLaunchClaimed) || errors.Is(err, store.ErrSandboxExists) {
 		// Only fresh Create interprets a claimed launch as identity conflict.
 		// Preserve the underlying error for internal diagnostics and tests.

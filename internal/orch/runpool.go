@@ -13,6 +13,7 @@ import (
 )
 
 type runPool struct {
+	preparedVM   bool
 	name         string
 	resourcePool string
 	capacity     *int
@@ -41,6 +42,7 @@ type runConsumeReq struct {
 	taskID       string
 	ctx          context.Context
 	commit       func(runID string) error
+	createTask   func(runID string) (string, error)
 	sessionFence func(runID string) (bool, func())
 	reservation  *runReservation
 	resp         chan runConsumeResp
@@ -151,6 +153,34 @@ func (p *runPool) assignWithReservation(ctx context.Context, taskID string, sess
 	// cancellation cannot turn a successfully committed handoff into an error.
 	res := <-req.resp
 	return res.runID, res.err
+}
+
+// AssignNew lets a prepared VM's immutable run identity participate in task
+// creation. The callback durably creates/adopts the task before the runner sees
+// its assignment. Failure quarantines the selected runner just like BindRunner;
+// no partially adopted VM can return to the idle pool.
+func (p *runPool) AssignNew(ctx context.Context, fence func(string) (bool, func()), create func(string) (string, error)) (string, string, error) {
+	return p.assignNewWithReservation(ctx, fence, create, nil)
+}
+
+func (p *runPool) assignNewWithReservation(ctx context.Context, fence func(string) (bool, func()), create func(string) (string, error), reservation *runReservation) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	if create == nil {
+		return "", "", fmt.Errorf("run pool: task creator required")
+	}
+	req := &runConsumeReq{ctx: ctx, createTask: create, sessionFence: fence, reservation: reservation, resp: make(chan runConsumeResp, 1)}
+	select {
+	case p.consumeCh <- req:
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	case <-p.done:
+		return "", "", fmt.Errorf("run pool: stopped")
+	}
+	// The actor's response is the linearization point, including cancellation.
+	res := <-req.resp
+	return req.taskID, res.runID, res.err
 }
 
 func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, bool, error) {
@@ -362,7 +392,16 @@ func (p *runPool) loop(ctx context.Context) {
 					continue
 				}
 			}
-			if err := req.commit(w.runID); err != nil {
+			var commitErr error
+			if req.createTask != nil {
+				req.taskID, commitErr = req.createTask(w.runID)
+				if commitErr == nil && req.taskID == "" {
+					commitErr = fmt.Errorf("run pool: creator returned empty task identity")
+				}
+			} else {
+				commitErr = req.commit(w.runID)
+			}
+			if err := commitErr; err != nil {
 				releaseSessionFence()
 				replyConsume(req, runConsumeResp{err: err})
 				// A failed commit may already have persisted execution identity.

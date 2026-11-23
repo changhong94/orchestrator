@@ -73,6 +73,8 @@ func main() {
 		err = configCmd(os.Args[2:], log)
 	case "workspace-storage":
 		err = workspacedisk.Serve(context.Background(), os.Stdin, os.Stdout)
+	case "fork-publish":
+		err = forkPublishCmd(os.Args[2:])
 	case "check-snapshot-runtime":
 		err = checkSnapshotRuntimeCmd(os.Stdin, os.Stdout)
 	case "checkpoint-cleanup":

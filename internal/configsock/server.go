@@ -567,6 +567,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildPrepare, s.handleBuildPrepare)
 	mux.HandleFunc("PUT "+PathRunSession, s.handleRunSession)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
+	mux.HandleFunc("POST "+PathRunPrepareVM, s.handleRunPrepareVM)
 	mux.HandleFunc("POST "+PathRunSandboxResult, s.handleSandboxResult)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc("POST "+PathRunBuildPhase, s.handleBuildPhase)

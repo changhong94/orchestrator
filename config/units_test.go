@@ -196,3 +196,26 @@ func TestRunPoolYAMLAnchorsAndMerges(t *testing.T) {
 		}
 	}
 }
+
+func TestPreparedVMPoolConfiguration(t *testing.T) {
+	var units UnitsConfig
+	raw := `{"runner_pools":[{"unit":"runner@.service","size":2,"prepared_vm":true,"name":"prepared"},{"unit":"runner@.service","size":0,"name":"cold"}]}`
+	if err := json.Unmarshal([]byte(raw), &units); err != nil {
+		t.Fatal(err)
+	}
+	if err := units.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !units.RunnerPools[0].PreparedVM {
+		t.Fatal("lost prepared flag")
+	}
+	units.RunnerPools = units.RunnerPools[:1]
+	if units.validate() == nil {
+		t.Fatal("allowed a deployment unable to restore snapshots")
+	}
+	units.RunnerPools = nil
+	units.BuilderPools = []RunPoolConfig{{Unit: "builder@.service", Size: 1, PreparedVM: true}}
+	if units.validate() == nil {
+		t.Fatal("builder cannot own prepared sandbox VMs")
+	}
+}

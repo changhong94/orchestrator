@@ -30,7 +30,7 @@ import (
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
 // optional task-local artifact preparation, and starts the sandbox-ctl child.
 // runAssignedSandbox has locked the run pidfile before this function is called.
-func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger) error {
+func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runID string, ready, vmmCgroup *os.File, log *slog.Logger, prepared ...*preparedSandboxChild) error {
 	// Keep a registered signal channel across the handoff from preparation to
 	// the runtime, including the file baseline read before Start.
 	stopSignals := make(chan os.Signal, 2)
@@ -47,6 +47,9 @@ func launchTask(ctx context.Context, stopContext func(), socket, sandboxID, runI
 			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
 		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
+			if len(prepared) > 0 && prepared[0] != nil {
+				return prepared[0].launchAndReport(socket, sandboxID, runID, path, argv, env, ready, metricsIdentity, stopSignals, log)
+			}
 			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
 		},
 		log: log,
@@ -175,7 +178,15 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	}
 	argv := []string{spec.Exec, "run"}
 	argv = append(argv, spec.Args[1:]...)
-	if !preparedSource.Empty() {
+	nativeFork := false
+	for _, arg := range spec.Args {
+		if arg == "--native-fork-parent" {
+			nativeFork = true
+		}
+	}
+	// A running-parent fork derives its disk and process state at the live
+	// capture barrier, not from the parent's historical template artifact.
+	if !preparedSource.Empty() && !nativeFork {
 		switch preparedSource.Kind {
 		case types.ResumeSourceSandbox:
 			argv = append(argv, "--from", preparedSource.Ref)
@@ -393,6 +404,10 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		_ = cmd.Process.Signal(sig)
 	default:
 	}
+	return finishSandboxChildAndReport(cmd.Wait, socket, sandboxID, runID, metrics)
+}
+
+func finishSandboxChildAndReport(wait func() error, socket, sandboxID, runID string, metrics *runnerMetrics) error {
 	var stop context.CancelFunc
 	var sampled chan struct{}
 	if metrics != nil {
@@ -402,7 +417,7 @@ func startSandboxChildAndReport(socket, sandboxID, runID, path string, argv, env
 		sampled = make(chan struct{})
 		go metrics.sampleUntil(sampleCtx, sampled)
 	}
-	err := cmd.Wait()
+	err := wait()
 	if metrics != nil {
 		stop()
 		<-sampled

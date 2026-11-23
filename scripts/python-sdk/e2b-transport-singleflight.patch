@@ -1,0 +1,40 @@
+--- a/e2b/api/client_sync/__init__.py
++++ b/e2b/api/client_sync/__init__.py
+@@ -9,6 +9,8 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++_transport_init_lock = threading.Lock()
++
+ 
+ def get_api_client(config: ConnectionConfig, **kwargs) -> ApiClient:
+     return ApiClient(
+@@ -41,13 +43,21 @@
+     if cached is not None:
+         return cached
+ 
+-    transport = TransportWithLogger(
+-        limits=limits,
+-        proxy=config.proxy,
+-        http2=http2,
+-    )
+-    TransportWithLogger._instances[http2] = transport
+-    return transport
++    # Serialize only first construction. Without the second check concurrent
++    # first callers each create an SSL context and a redundant connection pool.
++    # HTTPX transports are already shared on the steady-state path.
++    with _transport_init_lock:
++        cached = TransportWithLogger._instances.get(http2)
++        if cached is not None:
++            return cached
++        transport = TransportWithLogger(
++            limits=limits,
++            proxy=config.proxy,
++            http2=http2,
++        )
++        TransportWithLogger._instances[http2] = transport
++        return transport
++
+ 
+ 
+ class EnvdTransportWithLogger(TransportWithLogger):

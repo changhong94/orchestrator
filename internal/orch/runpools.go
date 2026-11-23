@@ -25,6 +25,7 @@ func newRunPools(kind string, configs []config.RunPoolConfig, wait time.Duration
 	for i, cfg := range configs {
 		p := newRunPool(kind, cfg.Size, wait, root, lc, func(id string) string { return instanceUnit(cfg.Unit, id) }, log.With("pool", i, "unit", cfg.Unit))
 		p.runs = runs
+		p.preparedVM = cfg.PreparedVM
 		p.name, p.resourcePool, p.capacity, p.priority = cfg.PoolName(logicalPoolKind(kind), i), cfg.ResourcePoolName(), cfg.Capacity, cfg.Priority
 		out.pools = append(out.pools, p)
 	}
@@ -63,6 +64,9 @@ func (p *runPools) assignInResourcePool(ctx context.Context, resourcePool, taskI
 	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
 	for _, pool := range candidates {
+		if pool.preparedVM {
+			continue
+		}
 		if resourcePool != "" && pool.resourcePool != resourcePool {
 			continue
 		}
@@ -74,6 +78,26 @@ func (p *runPools) assignInResourcePool(ctx context.Context, resourcePool, taskI
 		return pool.assignWithReservation(ctx, taskID, sessionFence, commit, reservation)
 	}
 	return "", fmt.Errorf("no runner supply in resource pool %q", resourcePool)
+}
+
+// AssignNew uses the same capacity reservations and priority order as ordinary
+// assignments. A prepared VM changes when identity is chosen, not admission.
+func (p *runPools) AssignNew(ctx context.Context, resourcePool string, fence func(string) (bool, func()), create func(string) (string, error)) (string, string, error) {
+	candidates := append([]*runPool(nil), p.pools...)
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].priority > candidates[j].priority })
+	for _, pool := range candidates {
+		if resourcePool != "" && pool.resourcePool != resourcePool {
+			continue
+		}
+		reservation := pool.runs.reserve(pool)
+		if reservation == nil {
+			continue
+		}
+		defer reservation.release()
+		return pool.assignNewWithReservation(ctx, fence, create, reservation)
+	}
+	return "", "", fmt.Errorf("no runner supply in resource pool %q", resourcePool)
 }
 
 func (p *runPools) hasSupply(resourcePool string) bool {
@@ -342,4 +366,16 @@ func (r *runIndex) wait(ctx context.Context, runID string) (string, bool, error)
 		return "", false, fmt.Errorf("run %s is not waiting for assignment", runID)
 	}
 	return p.WaitAssignment(ctx, runID)
+}
+
+// PreparedPool returns the configured pool family for image-independent VMs.
+// Cold/restore assignments never consume these runners under a different ID.
+func (p *runPools) PreparedPool() *runPools {
+	out := &runPools{}
+	for _, pool := range p.pools {
+		if pool.preparedVM {
+			out.pools = append(out.pools, pool)
+		}
+	}
+	return out
 }

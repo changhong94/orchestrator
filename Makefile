@@ -42,7 +42,7 @@ endef
 all: build
 
 # `build` ships the control-plane binaries.
-build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
+build: node-ctl node-checkpoint cluster-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
@@ -145,3 +145,10 @@ help:
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
+
+# Same tenant-isolated cleanup CLI, without conductor/proxy initialization.
+.PHONY: node-checkpoint
+node-checkpoint:
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-checkpoint" ./cmd/node-ctl/checkpoint_entry.go ./cmd/node-ctl/checkpoint.go
+	$(call link_bin,node-checkpoint)

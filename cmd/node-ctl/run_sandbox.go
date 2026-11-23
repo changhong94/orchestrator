@@ -34,7 +34,13 @@ func runSandbox(args []string, log *slog.Logger) error {
 	if *pidfile == "" || *socket == "" || *runID == "" {
 		return fmt.Errorf("run-sandbox: --pidfile, --config-socket, and --run-id required")
 	}
+	var prepared *preparedSandboxChild
 	return runAssignedSandbox(*pidfile, *socket, *runID, runSandboxOps{
+		prepareVM: func(socket, runID string, cgroup *os.File) (*preparedSandboxChild, error) {
+			var err error
+			prepared, err = startPreparedSandbox(socket, runID, cgroup)
+			return prepared, err
+		},
 		lockPidfile:    lockPidfile,
 		prepareCgroup:  func() (*os.File, error) { return prepareRunnerCgroup(*runID) },
 		openSession:    openRunSessionKeeper,
@@ -43,7 +49,7 @@ func runSandbox(args []string, log *slog.Logger) error {
 		launchTask: func(socket, sid, runID string, ready, cgroup *os.File) error {
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
-			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log)
+			return launchTask(ctx, stop, socket, sid, runID, ready, cgroup, log, prepared)
 		},
 	})
 }
@@ -55,6 +61,7 @@ func openRunSessionKeeper(ctx context.Context, socket, kind, runID string) (runS
 }
 
 type runSandboxOps struct {
+	prepareVM      func(string, string, *os.File) (*preparedSandboxChild, error)
 	lockPidfile    func(string) error
 	prepareCgroup  func() (*os.File, error)
 	openSession    func(context.Context, string, string, string) (runSessionCloser, error)
@@ -79,7 +86,25 @@ func runAssignedSandbox(pidfile, socket, runID string, ops runSandboxOps) error 
 		}
 		defer session.Close()
 	}
-	sid, err := waitSandboxAssignmentWithRetry(context.Background(), socket, runID, ops.waitAssignment)
+	waitCtx, cancelWait := context.WithCancel(context.Background())
+	defer cancelWait()
+	if ops.prepareVM != nil {
+		prepared, err := ops.prepareVM(socket, runID, vmmCgroup)
+		if err != nil {
+			return err
+		}
+		if prepared != nil {
+			defer prepared.Close()
+			go func() {
+				select {
+				case <-prepared.done:
+					cancelWait()
+				case <-waitCtx.Done():
+				}
+			}()
+		}
+	}
+	sid, err := waitSandboxAssignmentWithRetry(waitCtx, socket, runID, ops.waitAssignment)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
 	}
