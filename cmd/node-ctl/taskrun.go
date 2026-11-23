@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
 )
 
 // launchTask fetches the already-authenticated exact-run bootstrap, performs
@@ -38,9 +40,26 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 	// Keep a registered signal channel across the handoff from preparation to
 	// the runtime, including the file baseline read before Start.
 	stopSignals := make(chan os.Signal, 2)
-	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(stopSignals)
+	if instanceenv.Shared(ctx) {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+				select {
+				case stopSignals <- syscall.SIGTERM:
+				case <-done:
+				}
+			case <-done:
+			}
+		}()
+	} else {
+		signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
+		defer signal.Stop(stopSignals)
+	}
 	var metricsIdentity runnerMetricsIdentity
+	baseEnvironment := instanceenv.Environ(ctx)
+	instanceEnvironment := map[string]string{}
 	err := launchTaskWith(ctx, stopContext, socket, sandboxID, runID, ready, vmmCgroup, taskLaunchOps{
 		fetchBootstrap: func(ctx context.Context, socket, sid, rid string) (*configsock.SandboxTaskSpec, error) {
 			if bootstrap != nil {
@@ -49,6 +68,11 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 			return configsock.FetchSandboxTaskSpec(ctx, socket, sid, rid)
 		},
 		prepareArtifact: func(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*taskartifact.Result, error) {
+			scoped, scopeErr := instanceenv.With(ctx, taskEnvFrom(baseEnvironment, instanceEnvironment))
+			if scopeErr != nil {
+				return nil, scopeErr
+			}
+			ctx = scoped
 			var result *taskartifact.Result
 			var err error
 			if len(prepared) > 0 && prepared[0] != nil {
@@ -72,19 +96,44 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 			if err == nil && spec.SnapshotRuntime != "" && len(prepared) > 0 && prepared[0] != nil && result.PreparedSource.Kind == types.ResumeSourceSnapshot && strings.HasPrefix(result.PreparedSource.Ref, "file://") {
 				err = json.NewEncoder(prepared[0].input).Encode(map[string]any{"source": map[string]any{
 					"ref": result.PreparedSource.Ref, "sandbox_hint": result.PreparedSource.SandboxRef, "locations": result.RefLocationURIs, "manifest_config": spec.ManifestConfig,
-				}, "env": taskEnv(nil)})
+				}, "env": taskEnvFrom(baseEnvironment, instanceEnvironment)})
 			}
 			return result, err
 		},
 		completePrepare: configsock.CompleteSandboxPrepare,
-		setenv:          os.Setenv,
-		chdir:           os.Chdir,
+		setenv:          func(key, value string) error { instanceEnvironment[key] = value; return nil },
+		chdir: func(path string) error {
+			if !instanceenv.Shared(ctx) {
+				return os.Chdir(path)
+			}
+			if !filepath.IsAbs(path) {
+				return fmt.Errorf("shared task requires absolute workdir")
+			}
+			st, e := os.Stat(path)
+			if e != nil {
+				return e
+			}
+			if !st.IsDir() {
+				return fmt.Errorf("task workdir is not a directory")
+			}
+			return nil
+		},
 		captureIdentity: func(spec *configsock.SandboxTaskSpec) {
 			metricsIdentity = runnerMetricsIdentity{sandboxID: sandboxID, stableID: spec.StableID, runID: runID, baseDir: spec.BaseDir, runDir: spec.Workdir}
 		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
 			if len(prepared) > 0 && prepared[0] != nil {
 				return prepared[0].launchAndReport(socket, sandboxID, runID, path, argv, env, ready, metricsIdentity, stopSignals, log)
+			}
+			if instanceenv.Shared(ctx) {
+				if launchSharedRun == nil {
+					return fmt.Errorf("shared runtime is unavailable")
+				}
+				metrics := newRunnerMetrics(metricsIdentity, log)
+				if metrics != nil {
+					metrics.captureUsageBaseline(ctx)
+				}
+				return finishSandboxChildAndReport(func() error { return launchSharedRun(ctx, path, argv, env, vmmCgroup, ready) }, socket, sandboxID, runID, metrics)
 			}
 			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
 		},
@@ -243,7 +292,7 @@ func launchTaskWith(ctx context.Context, stopContext func(), socket, sandboxID, 
 	}
 	argv = appendRefLocationArgs(argv, locations)
 	authoritativeEnv := mergeAuthoritativeEnv(spec.Env, bootstrap.Env)
-	env := taskEnv(authoritativeEnv)
+	env := taskEnvFrom(instanceenv.Environ(ctx), authoritativeEnv)
 	// Preparation cancellation must not become the runtime lifetime. The
 	// sole spawn boundary derives child FD numbers and owns readiness Close.
 	cancelDeadline()
@@ -364,36 +413,38 @@ func envDefault(p *string, key string) {
 // descriptor stays open in the parent to retain the lock, but is close-on-exec so
 // sandbox-ctl children cannot inherit the parent-owned RunID/Build pidfile. It is
 // never closed and never unlinked — the launcher does not clean up the pidfile.
-func lockPidfile(path string) error {
+func lockPidfile(path string) error { _, err := openLockedPidfile(path); return err }
+func openLockedPidfile(path string) (int, error) {
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return fmt.Errorf("open pidfile %s: %w", path, err)
+		return -1, fmt.Errorf("open pidfile %s: %w", path, err)
 	}
 	lk := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
 	if err := unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &lk); err != nil {
 		unix.Close(fd)
-		return fmt.Errorf("pidfile %s locked (task already running?): %w", path, err)
+		return -1, fmt.Errorf("pidfile %s locked (task already running?): %w", path, err)
 	}
 	if err := unix.Ftruncate(fd, 0); err != nil {
 		unix.Close(fd)
-		return fmt.Errorf("truncate pidfile: %w", err)
+		return -1, fmt.Errorf("truncate pidfile: %w", err)
 	}
 	if _, err := unix.Pwrite(fd, []byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
 		unix.Close(fd)
-		return fmt.Errorf("write pidfile: %w", err)
+		return -1, fmt.Errorf("write pidfile: %w", err)
 	}
-	return nil
+	return fd, nil
 }
 
 // taskEnv returns the child environment: the inherited env minus the TASK_* bootstrap
 // vars, plus the spec's added env (secrets like MANIFEST_KEY).
-func taskEnv(add map[string]string) []string {
+func taskEnv(add map[string]string) []string { return taskEnvFrom(os.Environ(), add) }
+func taskEnvFrom(base []string, add map[string]string) []string {
 	skip := map[string]bool{
 		"TASK_PIDFILE": true, "TASK_CONFIG_SOCKET": true,
 		"TASK_RUN_ID": true, "TASK_SANDBOX_ID": true, "TASK_BUILD_ID": true,
 	}
-	out := make([]string, 0, len(os.Environ())+len(add))
-	for _, kv := range os.Environ() {
+	out := make([]string, 0, len(base)+len(add))
+	for _, kv := range base {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			key := kv[:i]
 			if skip[key] {
@@ -498,6 +549,15 @@ func sandboxExecutionResult(sandboxID, runID string, stage types.SandboxExecutio
 				result.ExitCode = &code
 			} else if status.Signaled() {
 				result.Signal = status.Signal().String()
+			}
+		}
+	}
+	if result.ExitCode == nil && result.Signal == "" {
+		var coded interface{ ExitCode() int }
+		if errors.As(err, &coded) {
+			code := coded.ExitCode()
+			if code >= 0 {
+				result.ExitCode = &code
 			}
 		}
 	}

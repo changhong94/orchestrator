@@ -58,10 +58,11 @@ type vsClient interface {
 }
 
 type Orchestrator struct {
-	hostObserver *conductorHostObserver // wired during startup, before reconciliation
-	holdMu       sync.Mutex
-	holds        map[string]holdProjection
-	holdRecovery idleclock.Point
+	imageTemplateCatalogCache sync.Map               // configured path -> immutable parsed catalog
+	hostObserver              *conductorHostObserver // wired during startup, before reconciliation
+	holdMu                    sync.Mutex
+	holds                     map[string]holdProjection
+	holdRecovery              idleclock.Point
 
 	idleNow        func() idleclock.Point
 	idleMu         sync.Mutex
@@ -1524,6 +1525,12 @@ func validateCaptureRequest(request sandboxcfg.CaptureRequest) error {
 }
 
 func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox, request sandboxcfg.CaptureRequest, beforeCapture ...func() error) (string, error) {
+	stageStart := time.Now()
+	stage := func(name string) {
+		now := time.Now()
+		o.log.Info("pause phase", "sid", sb.ID, "stage", name, "duration_ms", float64(now.Sub(stageStart))/1e6)
+		stageStart = now
+	}
 	if sb.State == types.StatePaused {
 		return "", api.ErrAlreadyPaused
 	}
@@ -1561,6 +1568,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if err := o.preparePause(opCtx, sb, request, beforeCapture...); err != nil {
 		return "", err
 	}
+	stage("prepare_barrier")
 	captureStarted := time.Now()
 	result, err := o.capture(opCtx, sb, request)
 	o.log.Info("pause capture completed", "sid", sb.ID, "capture_ms", float64(time.Since(captureStarted))/1e6, "err", err)
@@ -1568,6 +1576,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		o.rollbackPause(opCtx, sb)
 		return "", err
 	}
+	stage("capture_rpc")
 	changed, err := o.st.CommitPaused(opCtx, sb.ID, sb.RunID, result.Source, result.CheckpointID)
 	if err != nil {
 		return "", fmt.Errorf("orch: commit pause %s: %w", sb.ID, err)
@@ -1575,6 +1584,7 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if !changed {
 		return "", fmt.Errorf("orch: commit pause %s: running sandbox is no longer owned by runner %s", sb.ID, sb.RunID)
 	}
+	stage("commit_paused")
 	paused := cloneSandbox(sb)
 	paused.ResumeSource = result.Source
 	paused.LaunchMode = ""
@@ -1594,9 +1604,11 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 		o.log.Warn("pause: ownership cleanup incomplete", "sid", paused.ID, "err", err)
 		o.startPausedCleanupRetry(paused.ID)
 	}
+	stage("ownership_cleanup")
 	o.cache(paused)
 	o.publishUpsert(paused) // proxies keep the (now paused) route so traffic triggers a Wake
 	o.observeSandboxUpsert(paused)
+	stage("publish_paused")
 	return result.CheckpointID, nil
 }
 
@@ -1619,11 +1631,18 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		return err
 	}
 	defer release()
+	stageStart := time.Now()
+	stage := func(name string) {
+		now := time.Now()
+		o.log.Info("pause cleanup phase", "sid", sb.ID, "stage", name, "duration_ms", float64(now.Sub(stageStart))/1e6)
+		stageStart = now
+	}
 	runID := sb.RunID
 	if runID != "" {
 		if err := o.fenceSandboxRunner(ctx, runID); err != nil {
 			return err
 		}
+		stage("runner_fence")
 		changed, err := o.st.ClearPausedRunner(ctx, sb.ID, runID)
 		if err != nil {
 			return err
@@ -1634,6 +1653,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		o.runs.forget(runID)
 		sb.RunID = ""
 	}
+	stage("runner_commit")
 	if port := sb.VswitchPort; port != "" {
 		o.networkAllocationMu.Lock()
 		detachErr := o.detachObservedSandboxPortLocked(ctx, port, sb, runID)
@@ -1658,6 +1678,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		}
 		sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = "", "", "", ""
 	}
+	stage("network_detach_commit")
 	removeRunDir := o.removeSandboxRunDir
 	if removeRunDir == nil {
 		removeRunDir = os.RemoveAll
@@ -1666,9 +1687,11 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		if err := o.cleanupCheckpoint(ctx, sb); err != nil {
 			return err
 		}
+		stage("checkpoint_cleanup")
 		if err := removeRunDir(runDir); err != nil {
 			return fmt.Errorf("remove paused sandbox RunDir %s: %w", runDir, err)
 		}
+		stage("remove_runtime_dir")
 		changed, err := o.st.ClearPausedRunDir(ctx, sb.ID, runDir, sb.EnvdUDS, sb.CiUDS)
 		if err != nil {
 			return err
@@ -1678,6 +1701,7 @@ func (o *Orchestrator) cleanupPausedOwnership(ctx context.Context, sb *types.San
 		}
 		sb.RunDir, sb.EnvdUDS, sb.CiUDS = "", "", ""
 	}
+	stage("runtime_dir_commit")
 	return nil
 }
 
@@ -2578,6 +2602,8 @@ func sandboxTaskEnv(sb *types.Sandbox) map[string]string {
 }
 
 func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, runID string, summary configsock.ArtifactPrepareSummary) (*configsock.LaunchSpec, error) {
+	mark, finish := admissionStageTiming("prepare_handoff", sandboxID)
+	defer finish()
 	attempt, ok := o.launches.Lookup(sandboxID)
 	if !ok || attempt.RunID() != runID {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
@@ -2589,6 +2615,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 	if sb == nil || sb.RunID != runID || (sb.State != types.StateStarting && sb.State != types.StateRunning) {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
+	mark("identity_lookup")
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {
 		return nil, configsock.RejectArtifactPrepare(err)
@@ -2604,10 +2631,12 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 		o.log.Info("sandbox task artifact prepare replay", "sid", sandboxID, "run_id", runID,
 			"task_artifact_prepare_replay_total", 1)
 	}
+	mark("validate_submit")
 	final, err := attempt.WaitFinalSpec(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
+	mark("wait_final_spec")
 	current, err := o.st.GetLaunchIdentity(ctx, sandboxID)
 	if err != nil {
 		return nil, err
@@ -2617,6 +2646,7 @@ func (o *Orchestrator) CompleteSandboxPrepare(ctx context.Context, sandboxID, ru
 		validateSandboxPreparedPair(summary, current, tmpl) != nil {
 		return nil, configsock.RejectArtifactPrepare(errLaunchOwnershipLost)
 	}
+	mark("identity_recheck")
 	return final, nil
 }
 
@@ -2738,13 +2768,17 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 }
 
 func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
-	var runIDs []string
+	// Never acquire runSessionsMu with a store cursor open: assignment holds
+	// that fence while durably inserting its owner using the same writer
+	// connection. Collect only the identities needed for maintenance first.
+	type candidate struct {
+		runID    string
+		terminal bool
+	}
+	var candidates []candidate
 	collect := func(sb *types.Sandbox) error {
-		if sb.RunID == "" {
-			return nil
-		}
-		if sb.ExecutionResult != nil || sb.DeadRunID == sb.RunID || !o.runSessionActive(runKindSandbox, sb.RunID) {
-			runIDs = append(runIDs, sb.RunID)
+		if sb.RunID != "" {
+			candidates = append(candidates, candidate{sb.RunID, sb.ExecutionResult != nil || sb.DeadRunID == sb.RunID})
 		}
 		return nil
 	}
@@ -2753,8 +2787,10 @@ func (o *Orchestrator) queueMissingRunSessionChecks(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, runID := range runIDs {
-		o.startSandboxRunEndCheck(runID)
+	for _, c := range candidates {
+		if c.terminal || !o.runSessionActive(runKindSandbox, c.runID) {
+			o.startSandboxRunEndCheck(c.runID)
+		}
 	}
 	return nil
 }
@@ -3283,6 +3319,12 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 	if err != nil {
 		return types.ResumeSource{}, fmt.Errorf("orch: create disk Checkpoint ID: %w", err)
 	}
+	if request.Kind == types.CaptureSnapshot {
+		source, used, directErr := o.captureLocalSocket(ctx, sb, request, id.String())
+		if used {
+			return source, directErr
+		}
+	}
 	dir := filepath.Join(sb.BaseDir, "checkpoint")
 	command := "snapshot"
 	kind := types.ResumeSourceSnapshot
@@ -3299,11 +3341,22 @@ func (o *Orchestrator) snapshotLocalWithCheckpointID(ctx context.Context, sb *ty
 		if request.Kind == types.CaptureSnapshot {
 			args = appendSnapshotPolicyArgs(args, request.SnapshotPolicy)
 		}
-		cmd := exec.CommandContext(ctx, o.executables.SandboxCtl(), args...)
+		resolveStart := time.Now()
+		executable := o.executables.SandboxCtl()
+		o.log.Info("capture client phase", "sid", sb.ID, "stage", "resolve_executable", "duration_ms", float64(time.Since(resolveStart))/1e6)
+		cmd := exec.CommandContext(ctx, executable, args...)
 		var out, errb bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &errb
 		inheritSourceOperation(ctx, cmd)
-		if err := cmd.Run(); err != nil {
+		start := time.Now()
+		err := cmd.Start()
+		o.log.Info("capture client phase", "sid", sb.ID, "stage", "start_process", "duration_ms", float64(time.Since(start))/1e6)
+		if err == nil {
+			start = time.Now()
+			err = cmd.Wait()
+			o.log.Info("capture client phase", "sid", sb.ID, "stage", "wait_process", "duration_ms", float64(time.Since(start))/1e6)
+		}
+		if err != nil {
 			return types.ResumeSource{}, fmt.Errorf("orch: %s %s (mode %s): %w: %s", command, sb.ID, o.cfg.Checkpoint.Mode, err, errb.String())
 		}
 		return decodeCaptureSource(out.Bytes(), kind)

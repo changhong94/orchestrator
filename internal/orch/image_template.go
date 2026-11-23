@@ -1,6 +1,7 @@
 package orch
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,19 +47,15 @@ func (o *Orchestrator) selectImageTemplate(req api.CreateReq) (api.CreateReq, er
 		if len(raw) > 1<<20 {
 			return req, fmt.Errorf("image template catalog too large")
 		}
-		var catalog struct {
-			Identity struct {
-				Image      string `json:"image_template"`
-				Credential string `json:"credential_fingerprint"`
-			} `json:"identity"`
-			ApplicationStarted *bool `json:"application_started"`
-			Template           struct {
-				ID       string            `json:"templateID"`
-				Metadata map[string]string `json:"metadata"`
-			} `json:"template"`
-		}
-		if err := json.Unmarshal(raw, &catalog); err != nil {
-			return req, fmt.Errorf("image template catalog: %w", err)
+		var catalog *imageTemplateCatalog
+		if cached, ok := o.imageTemplateCatalogCache.Load(path); ok && bytes.Equal(cached.(*imageTemplateCatalogEntry).raw, raw) {
+			catalog = cached.(*imageTemplateCatalogEntry).catalog
+		} else {
+			catalog = new(imageTemplateCatalog)
+			if err := json.Unmarshal(raw, catalog); err != nil {
+				return req, fmt.Errorf("image template catalog: %w", err)
+			}
+			o.imageTemplateCatalogCache.Store(path, &imageTemplateCatalogEntry{raw: raw, catalog: catalog})
 		}
 		if catalog.Identity.Image != req.TemplateID || catalog.Identity.Credential != hex.EncodeToString(fingerprint[:]) {
 			continue
@@ -78,4 +75,22 @@ func (o *Orchestrator) selectImageTemplate(req api.CreateReq) (api.CreateReq, er
 		return req, nil
 	}
 	return req, nil
+}
+
+// Cached values are immutable. Every lookup compares the complete file contents;
+// filesystem timestamps never authorize reuse, and returned metadata is cloned.
+type imageTemplateCatalog struct {
+	Identity struct {
+		Image      string `json:"image_template"`
+		Credential string `json:"credential_fingerprint"`
+	} `json:"identity"`
+	ApplicationStarted *bool `json:"application_started"`
+	Template           struct {
+		ID       string            `json:"templateID"`
+		Metadata map[string]string `json:"metadata"`
+	} `json:"template"`
+}
+type imageTemplateCatalogEntry struct {
+	raw     []byte
+	catalog *imageTemplateCatalog
 }

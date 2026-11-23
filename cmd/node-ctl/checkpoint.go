@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
 	"github.com/kuasar-sandbox/orchestrator/internal/reflocation"
@@ -22,6 +23,11 @@ import (
 // committed S/E and fenced its users. Sandboxer owns interpretation/deletion;
 // this adapter supplies the existing node ref-location policy.
 func checkpointCleanupCmd(args []string) error {
+	started := time.Now()
+	stage := func(name string) {
+		fmt.Fprintf(os.Stderr, "CHECKPOINT_TOOL stage=%s duration=%s\n", name, time.Since(started))
+		started = time.Now()
+	}
 	fs := flag.NewFlagSet("checkpoint-cleanup", flag.ContinueOnError)
 	sid := fs.String("sandbox-id", "", "capture producer identity")
 	pathID := fs.String("path-id", "", "owned base directory leaf (defaults to sandbox-id)")
@@ -52,10 +58,12 @@ func checkpointCleanupCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	stage("config")
 	storage, err := artifact.NewProcessStorage(cfg)
 	if err != nil {
 		return err
 	}
+	stage("storage_open")
 	checkpoint := artifact.Checkpoint{
 		Directory: filepath.Join(sandbox.DefaultBaseDir(*base, leaf), "checkpoint"), SandboxID: *sid,
 		SandboxRef: *e, SnapshotRef: *s, Retain: retained,
@@ -73,5 +81,8 @@ func checkpointCleanupCmd(args []string) error {
 	} else {
 		err = storage.CleanupCheckpoint(ctx, checkpoint)
 	}
-	return errors.Join(err, storage.Close())
+	stage("cleanup")
+	closeErr := storage.Close()
+	stage("storage_close")
+	return errors.Join(err, closeErr)
 }

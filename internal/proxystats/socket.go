@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/telemetryview"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -33,17 +34,14 @@ type TrafficQuery struct {
 	State     types.State   `json:"state"`
 }
 
-type physicalTelemetryKey struct{}
-
 // WithPhysicalTelemetry selects the original Proxy idle timestamp for a
 // connection-only Telemetry reader. It is local to the authorized stats call.
 func WithPhysicalTelemetry(ctx context.Context) context.Context {
-	return context.WithValue(ctx, physicalTelemetryKey{}, true)
+	return telemetryview.WithPhysical(ctx)
 }
 
 func IsPhysicalTelemetry(ctx context.Context) bool {
-	physical, _ := ctx.Value(physicalTelemetryKey{}).(bool)
-	return physical
+	return telemetryview.IsPhysical(ctx)
 }
 
 type BatchRequest struct {

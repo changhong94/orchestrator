@@ -29,6 +29,7 @@ import (
 )
 
 type Store struct {
+	wal          *walMaintenance
 	db           *sql.DB
 	readers      *sql.DB
 	getStmt      *sql.Stmt
@@ -396,6 +397,11 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		st.Close()
 		return nil, err
 	}
+	st.wal, err = startWALMaintenance(absPath)
+	if err != nil {
+		st.Close()
+		return nil, fmt.Errorf("store: WAL maintenance: %w", err)
+	}
 	return st, nil
 }
 
@@ -451,7 +457,7 @@ func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition str
 }
 
 func (s *Store) Close() error {
-	var err error
+	err := s.wal.close()
 	if s.getStmt != nil {
 		err = errors.Join(err, s.getStmt.Close())
 	}

@@ -42,6 +42,29 @@ func TestImageTemplateSelectionPreservesTenantAndColdSemantics(t *testing.T) {
 			}
 		})
 	}
+	// Mutating the returned map must not modify the cached tenant catalog.
+	got, err := o.selectImageTemplate(api.CreateReq{APIKey: key, TemplateID: image})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Metadata["kuasar-sandbox.restore"] = `{"fork_identity":false}`
+	if _, err := o.selectImageTemplate(api.CreateReq{APIKey: key, TemplateID: image}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.selectImageTemplate(api.CreateReq{APIKey: key, TemplateID: image}); err == nil {
+		t.Fatal("stale cached catalog accepted after same-time content change")
+	}
+
 	catalog["template"] = map[string]any{"templateID": snapshot, "metadata": map[string]string{"kuasar-sandbox.restore": `{"fork_identity":false}`}}
 	raw, _ = json.Marshal(catalog)
 	os.WriteFile(path, raw, 0600)

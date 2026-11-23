@@ -1030,3 +1030,12 @@ method/path/raw query、body、status 与 relevant headers。它过滤 hop-by-ho
 telemetry endpoint、UDS 请求失败或 query backend 不可用返回 503。客户端取消传播到
 HTTP UDS 和 backend query。查询不调用 Wake、Resume、import、reservation 或 guest
 control API；读取 paused 历史不会接触沙箱。
+
+启用 `KUASAR_STORE_TIMING` 后，`STORE_ADMISSION` 分别记录连接排队、SQLite
+写事务锁、事务操作和持久化提交；`STORE_WAL` 记录被动检查点耗时以及 WAL 总帧数、
+已回写帧数。节点存储参考旧 fork 的后台 WAL 维护方式，通过独立连接每 250 ms
+执行一次 PASSIVE 检查点，将已经提交的日志回写到数据库。提交本身仍同步：写连接
+保留 `synchronous=FULL`，并保留 SQLite 默认 1000 帧自动检查点作为兜底。
+长期读取事务可能延迟回写；后台维护不等待读者，也不丢弃 WAL。关闭存储前先结束
+维护线程。仅凭提交耗时不能区分 WAL 同步和自动检查点，应结合阶段日志判断；
+十个样本不能证明长尾已消失，也不用于估计尾部分位数。

@@ -126,6 +126,10 @@ func (o *Orchestrator) resourcePoolDropins() (map[string]string, error) {
 }
 
 func (o *Orchestrator) runnerUnitFile() string {
+	executable := o.cfg.Paths.RunnerExecutable
+	if executable == "" {
+		executable = o.executables.OrchestratorCtl()
+	}
 	return fmt.Sprintf(`[Unit]
 Description=kuasar sandbox runner %%i
 CollectMode=inactive-or-failed
@@ -147,7 +151,7 @@ Slice=sandbox-runner.slice
 # node-ctl remains the resident ctl/ parent; its direct sandbox-ctl child uses the handed-off vmm/ descriptor for Cloud Hypervisor.
 Delegate=yes
 # KillMode=control-group recursively covers both delegated subgroups.
-`, o.cfg.Paths.RunRoot, o.executables.OrchestratorCtl(), nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
+`, o.cfg.Paths.RunRoot, executable, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"), o.cfg.Paths.ConfigSocket, nodepath.RunnerPID(o.cfg.Paths.RunRoot, "%i"))
 }
 
 func (o *Orchestrator) builderUnitFile() string {

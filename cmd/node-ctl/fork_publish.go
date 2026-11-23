@@ -54,7 +54,9 @@ func forkPublishCmd(args []string) error {
 	}
 	if *destination != "" {
 		argv = append(argv, "--to-ref-location", *destination)
-	}
+	} else {
+ argv = append(argv, "--materialize-located")
+ }
 	argv = append(argv, fs.Arg(0))
 	self, err := os.Executable()
 	if err != nil {

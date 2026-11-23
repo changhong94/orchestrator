@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
+	"github.com/kuasar-sandbox/sandboxer/pkg/memtrace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -19,13 +23,23 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
+// The lightweight entry point installs this opt-in transport. The normal
+// node-ctl and unprepared/native-fork runners retain the subprocess transport.
+var launchPreparedEmbedded func(string, string, []*os.File) (func(), <-chan error, int, int, error)
+
 type preparedSandboxChild struct {
-	materials []*taskartifact.SlotMaterial
-	cmd       *exec.Cmd
-	input     *os.File
-	readiness *os.File
-	done      chan struct{}
-	err       error
+	executable        string
+	cgroupFD, readyFD int
+	cancel            func()
+
+	shared       bool
+	sharedCgroup *os.File
+	materials    []*taskartifact.SlotMaterial
+	cmd          *exec.Cmd
+	input        *os.File
+	readiness    *os.File
+	done         chan struct{}
+	err          error
 }
 
 func (p *preparedSandboxChild) Close() {
@@ -36,16 +50,39 @@ func (p *preparedSandboxChild) Close() {
 		return
 	default:
 	}
-	_ = p.cmd.Process.Signal(syscall.SIGTERM)
+	p.signal(syscall.SIGTERM)
 	select {
 	case <-p.done:
 	case <-time.After(5 * time.Second):
-		_ = p.cmd.Process.Kill()
+		if p.shared {
+			f, e := os.OpenFile(fmt.Sprintf("/proc/self/fd/%d/cgroup.kill", p.sharedCgroup.Fd()), os.O_WRONLY, 0)
+			if e == nil {
+				_, _ = f.WriteString("1")
+				f.Close()
+			}
+		} else if p.cancel != nil {
+			// One VM per process. A stuck embedded runtime must never be
+			// abandoned while the holder reports a completed teardown.
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		} else {
+			_ = p.cmd.Process.Kill()
+		}
 		<-p.done
 	}
 }
+func (p *preparedSandboxChild) signal(sig os.Signal) {
+	if p.cancel != nil {
+		p.cancel()
+	} else {
+		_ = p.cmd.Process.Signal(sig)
+	}
+}
+
 func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSandboxChild, retErr error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return startPreparedSandboxContext(context.Background(), socket, runID, cgroup)
+}
+func startPreparedSandboxContext(parent context.Context, socket, runID string, cgroup *os.File) (_ *preparedSandboxChild, retErr error) {
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	spec, err := configsock.FetchPreparedRuntime(ctx, socket, runID)
 	if err != nil {
@@ -57,18 +94,28 @@ func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSan
 	if spec.Exec == "" {
 		return nil, errors.New("prepared VM executable missing")
 	}
+	memtrace.Mark("runtime_spec_fetched")
 	// Initialize only host-side serialization schemas while the generic slot
 	// is being prepared. No image, tenant credential or guest command is read.
 	if err := warmPreparedLaunchCodecs(); err != nil {
 		return nil, fmt.Errorf("prepare launch codecs: %w", err)
 	}
-	stages, materials, err := stageCatalogFile(ctx, spec.Catalogs)
+	memtrace.Mark("codecs_prepared")
+	var stages *os.File
+	var values []restore.StagedCatalog
+	var materials []*taskartifact.SlotMaterial
+	if instanceenv.Shared(parent) {
+		values, materials, err = stageCatalogValues(ctx, spec.Catalogs)
+	} else {
+		stages, materials, err = stageCatalogFile(ctx, spec.Catalogs)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if stages != nil {
 		defer stages.Close()
 	}
+	memtrace.Mark("catalog_descriptors_prepared")
 	// All descriptors below are inherited once, at the sole child creation.
 	// The ready pipe is bridged to the task's socket only after durable assignment.
 	lr, lw, err := os.Pipe()
@@ -89,8 +136,8 @@ func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSan
 		return nil, err
 	}
 	defer rw.Close()
-	parent := filepath.Dir(socket)
-	file, err := os.CreateTemp(parent, "prepared-"+runID+"-*.json")
+	specDir := filepath.Dir(socket)
+	file, err := os.CreateTemp(specDir, "prepared-"+runID+"-*.json")
 	if err != nil {
 		lw.Close()
 		rr.Close()
@@ -114,16 +161,41 @@ func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSan
 		cmd.Args = append(cmd.Args, "--stage-fd=7")
 		cmd.ExtraFiles = append(cmd.ExtraFiles, stages)
 	}
-	cmd.Env = taskEnv(nil)
+	cmd.Env = taskEnvFrom(instanceenv.Environ(parent), nil)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err = cmd.Start(); err != nil {
-		lw.Close()
-		rr.Close()
-		return nil, err
+	p := &preparedSandboxChild{materials: materials, cmd: cmd, executable: cmd.Path, cgroupFD: 5, readyFD: 6, input: lw, readiness: rr, done: make(chan struct{})}
+	if instanceenv.Shared(parent) {
+		if launchSharedPrepared == nil {
+			return nil, fmt.Errorf("shared prepared runtime unavailable")
+		}
+		var result <-chan error
+		p.shared = true
+		p.sharedCgroup = cgroup
+		p.cancel, result, p.cgroupFD, p.readyFD, err = launchSharedPrepared(parent, spec.Exec, file.Name(), []*os.File{lr, pw, cgroup, rw, stages}, values)
+		if err != nil {
+			lw.Close()
+			rr.Close()
+			return nil, err
+		}
+		go func() { p.err = <-result; close(p.done) }()
+	} else if launchPreparedEmbedded != nil {
+		var result <-chan error
+		p.cancel, result, p.cgroupFD, p.readyFD, err = launchPreparedEmbedded(spec.Exec, file.Name(), []*os.File{lr, pw, cgroup, rw, stages})
+		if err != nil {
+			lw.Close()
+			rr.Close()
+			return nil, err
+		}
+		go func() { p.err = <-result; close(p.done) }()
+	} else {
+		if err = cmd.Start(); err != nil {
+			lw.Close()
+			rr.Close()
+			return nil, err
+		}
+		go func() { p.err = cmd.Wait(); close(p.done) }()
 	}
-	p := &preparedSandboxChild{materials: materials, cmd: cmd, input: lw, readiness: rr, done: make(chan struct{})}
-	go func() { p.err = cmd.Wait(); close(p.done) }()
 	defer func() {
 		if retErr != nil {
 			p.Close()
@@ -146,11 +218,17 @@ func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSan
 		return nil, fmt.Errorf("prepared VM exited: %v", p.err)
 	default:
 	}
+	// Catalog decoding and helper transport allocate temporary buffers. Retire
+	// them before advertising the idle slot, not on its eventual claim path.
+	if !instanceenv.Shared(parent) {
+		debug.FreeOSMemory()
+	}
+	memtrace.Mark("holder_ready")
 	slog.Info("prepared VM ready", "run_id", runID)
 	return p, nil
 }
 func (p *preparedSandboxChild) launchAndReport(socket, sid, runID, path string, argv, env []string, ready *os.File, identity runnerMetricsIdentity, stopSignals <-chan os.Signal, log *slog.Logger) error {
-	if path != p.cmd.Path || len(argv) < 2 || argv[1] != "run" {
+	if path != p.executable || len(argv) < 2 || argv[1] != "run" {
 		return errors.New("prepared runner executable changed")
 	}
 	for _, arg := range argv[2:] {
@@ -169,7 +247,7 @@ func (p *preparedSandboxChild) launchAndReport(socket, sid, runID, path string, 
 	markStage("usage_baseline")
 	bridgeDone := make(chan struct{})
 	go func() { _, _ = io.Copy(ready, p.readiness); _ = ready.Close(); close(bridgeDone) }()
-	args := append(append([]string(nil), argv[2:]...), "--cgroup-path=fd=5", "--ready-fd=6")
+	args := append(append([]string(nil), argv[2:]...), fmt.Sprintf("--cgroup-path=fd=%d", p.cgroupFD), fmt.Sprintf("--ready-fd=%d", p.readyFD))
 	err := json.NewEncoder(p.input).Encode(map[string]any{"args": args, "env": env})
 	markStage("pipe_encode_write")
 	flushStages()
@@ -181,11 +259,14 @@ func (p *preparedSandboxChild) launchAndReport(socket, sid, runID, path string, 
 		result := sandboxExecutionResult(sid, runID, types.SandboxResultStart, err)
 		return sandboxRunReportedError{err: errors.Join(err, postSandboxResultWithRetry(socket, sid, runID, result))}
 	}
-	select {
-	case sig := <-stopSignals:
-		_ = p.cmd.Process.Signal(sig)
-	default:
-	}
+	// Forward stop throughout the runtime, not only at the handoff instant.
+	go func() {
+		select {
+		case sig := <-stopSignals:
+			p.signal(sig)
+		case <-p.done:
+		}
+	}()
 	log.Info("prepared VM workload claimed", "sandbox_id", sid, "run_id", runID)
 	err = finishSandboxChildAndReport(func() error { <-p.done; return p.err }, socket, sid, runID, metrics)
 	_ = p.readiness.Close()

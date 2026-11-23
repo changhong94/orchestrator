@@ -1,0 +1,60 @@
+Shared sandbox controller (opt-in)
+
+Build node-runner, node-vm-runner, node-run-lease and sandbox-ctl from the same
+workspace. The native lease helper uses CC; when cross-compiling, CC must target
+the same architecture as the Go binaries. Deploy all matching binaries.
+
+node-vm-runner shared-runs owns the complete per-run lifecycle: prepared slots,
+artifact preparation, assignment, cold launch, running-parent fork child launch,
+readiness and durable result reporting. There is one shared Go VM controller.
+Each unit keeps a small native node-run-lease process, not a Go runtime.
+The initial node-runner register-shared locks the PID file, sets up the delegated
+cgroup, seals registration in a memfd and execs node-run-lease with the same PID.
+The POSIX PID lock survives exec; no Go heap remains in the instance process.
+
+Runner template drop-in requirements (preserve run-id/pidfile/config-socket args):
+[Unit]
+Requires=shared-vm-controller.service
+After=shared-vm-controller.service
+BindsTo=shared-vm-controller.service
+[Service]
+Environment=KUASAR_SHARED_RUN_SOCKET=/run/kuasar-shared-controller/runs.sock
+Environment=KUASAR_NATIVE_RUN_PROXY=/usr/bin/node-run-lease
+Environment=KUASAR_EMBEDDED_SANDBOX_SHA256=<sha256 of matching sandbox-ctl>
+# ExecStart must invoke node-runner register-shared, not run-sandbox.
+
+Use a root-owned mode0700 socket directory and deployment-specific storage/cache
+settings in the controller service. Host launch paths must be absolute; instances
+never change the shared process cwd or environment. Interactive host stdio is
+unsupported in shared mode; guest exec/command channels remain per instance.
+
+The root-only registration socket checks SO_PEERCRED, the delegated vmm cgroup,
+run-id/unit binding and PID-file identity. The native helper only dials its own
+fixed config socket. It passes connected socket FDs to the controller, so the
+unchanged config-socket server still authenticates the per-run helper PID.
+The shared PID is not added to an allowlist and cannot impersonate another run.
+Per-run dial aliases and credentials are removed on lifecycle completion.
+
+SIGTERM cancels one instance and allows final reporting. Proxy death cancels its
+lease. Runtime cleanup owns an independent cgroup capability; timeout escalation
+kills only that VM cgroup, never the shared controller. Normal readiness closes
+all duplicate writers before VM exit. Controller failure remains a shared failure
+domain; BindsTo stops dependent units rather than leaving unmanaged guests.
+
+Count the shared service, all lease processes, VMMs and product control services
+in memory accounting. Do not exclude shared controller memory from benchmarks.
+Legacy per-process entrypoints remain available when this mode is not enabled.
+
+With KUASAR_TEMPLATE_MEMORY_CACHE=1, set KUASAR_TEMPLATE_MEMORY_CACHE_DIR to a
+root-owned mode0700 directory on the deployment data filesystem. Generic slot
+preparation builds one sparse file per authenticated template, bounded by 1 GiB
+of allocated cache data. Data and directory are synced before publication.
+VMs map the same file privately with CoW; no mlock, anonymous full-RAM copy or
+interpreter warmup is used. Clean file cache pages remain reclaimable. An open
+shared flock lease protects each live restore from cache eviction, including
+when its runtime directory is on another filesystem. Rebuild from the original
+local/Manifest snapshot on a cache miss; this directory is not snapshot storage.
+Account allocated cache disk and page-cache residency separately from process
+PSS. Cold cache faults can still require disk IO, as with the old fork.
+Without CACHE_DIR the legacy tmpfs cache remains supported, but it can swap and
+is not a guarantee of warm physical memory. No memlock allowance is required.

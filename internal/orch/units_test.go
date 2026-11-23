@@ -203,3 +203,14 @@ func TestInstallUnitsReplacesOldRunnerExecutable(t *testing.T) {
 		t.Fatalf("installed runner=%s reloads=%d err=%v", b, lc.reloads, err)
 	}
 }
+
+func TestLightweightRunnerDoesNotReplaceBuilder(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Paths: config.PathsConfig{
+		RunRoot: "/run/test", ConfigSocket: "/run/test/ctl.sock", RunnerExecutable: "/opt/test/node-runner",
+	}}}
+	o.SetExecutables(configresolve.ExecutablesForNodeCtl("/opt/test/node-ctl"))
+	runner, builder := o.runnerUnitFile(), o.builderUnitFile()
+	if !strings.Contains(runner, "ExecStart=/opt/test/node-runner run-sandbox ") || !strings.Contains(builder, "ExecStart=/opt/test/node-ctl run-builder ") {
+		t.Fatalf("runner override changed wrong role: runner=%s builder=%s", runner, builder)
+	}
+}

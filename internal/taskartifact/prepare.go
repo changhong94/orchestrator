@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/kuasar-sandbox/orchestrator/internal/workspace"
+	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
 	"os"
 	"path/filepath"
 	"sort"
@@ -121,7 +122,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		return nil, err
 	}
 
-	manifestCfg, err := rtconfig.LoadManifestConfig(spec.ManifestConfig)
+	manifestCfg, err := instanceenv.ManifestConfig(ctx, spec.ManifestConfig)
 	if err != nil {
 		if !errors.Is(err, manifest.ErrConfigNotProvided) {
 			return nil, fmt.Errorf("task artifact prepare: manifest config: %w", err)
@@ -140,7 +141,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: image Bundle write admission: %w", err)
 		}
-		if err := artifact.ValidateSingleRootBundlePublication(manifestCfg, manifestCfg.CustomerKey, admission); err != nil {
+		if err := artifact.ValidateSingleRootBundlePublication(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg), admission); err != nil {
 			return nil, fmt.Errorf("task artifact prepare: image Bundle preflight: %w", err)
 		}
 	}
@@ -248,7 +249,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		} else if locationErr := addLocation("selected Sandbox E", name); locationErr != nil {
 			return nil, locationErr
 		}
-		sourceStorage, err := artifact.NewProcessStorage(manifestCfg)
+		sourceStorage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg))
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: initialize referenced Sandbox reader: %w", err)
 		}
@@ -288,7 +289,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		if spec.RootSandboxRef != "" {
 			return nil, errors.New("task artifact prepare: E-only source has a Snapshot association")
 		}
-		storage, err := artifact.NewProcessStorage(manifestCfg)
+		storage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg))
 		if err != nil {
 			return nil, fmt.Errorf("task artifact prepare: initialize Sandbox reader: %w", err)
 		}
@@ -361,7 +362,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 
 	var derivedRef string
 	if len(spec.SBXCreateWorkspaces) != 0 {
-		storage, err := artifact.NewProcessStorage(manifestCfg)
+		storage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg))
 		if err != nil {
 			return nil, err
 		}

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
 	"io"
 	"log"
 	"os"
@@ -59,7 +60,7 @@ func Prepare(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result,
 }
 func prepareCached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, error) {
 	started := time.Now()
-	access, err := preparedCacheFor(spec)
+	access, err := preparedCacheForContext(ctx, spec)
 	if err != nil || access == nil {
 		return prepareUncached(ctx, spec)
 	}
@@ -96,15 +97,18 @@ func prepareCached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*R
 	return result, nil
 }
 func preparedCacheFor(spec configsock.ArtifactPrepareSpec) (*preparedCacheAccess, error) {
+	return preparedCacheForContext(context.Background(), spec)
+}
+func preparedCacheForContext(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*preparedCacheAccess, error) {
 	dir := os.Getenv("KUASAR_PREPARED_ARTIFACT_CACHE")
 	if dir == "" || !filepath.IsAbs(dir) || spec.RootSourceKind != string(types.ResumeSourceSnapshot) || spec.LaunchMode != string(types.LaunchMemory) || spec.ReadSourceImageConfig || spec.PreflightImageBundle || len(spec.SBXCreateWorkspaces) != 0 || len(spec.SBXCreateMounts) != 0 {
 		return nil, nil
 	}
-	cfg, err := rtconfig.LoadManifestConfig(spec.ManifestConfig)
+	cfg, err := instanceenv.ManifestConfig(ctx, spec.ManifestConfig)
 	if err != nil {
 		return nil, err
 	}
-	key, err := cfg.CustomerKey()
+	key, err := instanceenv.CustomerKey(ctx, cfg)()
 	if err != nil {
 		return nil, err
 	}

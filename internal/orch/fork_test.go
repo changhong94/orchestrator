@@ -16,11 +16,18 @@ import (
 )
 
 func TestForkPublishesIndependentGraphBeforeCreate(t *testing.T) {
+	for _, target := range []string{"location", "manifest"} {
+		t.Run(target, func(t *testing.T) { testForkPublicationTarget(t, target) })
+	}
+}
+func testForkPublicationTarget(t *testing.T, target string) {
 	cfg := checkpointOrchestratorConfig(t, "local")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
+	cfg.Checkpoint.SnapshotTarget = target
+	cfg.Checkpoint.Remote.RefLocationParent = "file://" + t.TempDir()
 	o, parent, key, _, _, argsFile := newCheckpointPauseFixture(t, cfg, "")
 	_ = createRequestFixture(t, o, "1")
-	parent.Metadata = map[string]string{sandboxcfg.NsIdentity: `{"id":"do-not-inherit"}`, "app": "test", sandboxcfg.NsLaunch: `{"exec":"/do-not-repeat"}`, sandboxcfg.NsFiles: `[{"path":"/do-not-repeat"}]`, sandboxcfg.NsCredentials: `{"service_secret":"do-not-inherit"}`}
+	parent.Metadata = map[string]string{nativeForkParentKey: "original-host-owned-parent", sandboxcfg.NsIdentity: `{"id":"do-not-inherit"}`, "app": "test", sandboxcfg.NsLaunch: `{"exec":"/do-not-repeat"}`, sandboxcfg.NsFiles: `[{"path":"/do-not-repeat"}]`, sandboxcfg.NsCredentials: `{"service_secret":"do-not-inherit"}`}
 	if err := o.st.Put(context.Background(), parent); err != nil {
 		t.Fatal(err)
 	}
@@ -45,6 +52,9 @@ esac
 	}
 	if snapshot.TemplateID == "" || snapshot.ElapsedMS < 0 {
 		t.Fatal("live snapshot did not publish reusable template")
+	}
+	if _, ok := snapshot.Metadata[nativeForkParentKey]; ok {
+		t.Fatal("snapshot leaked host-owned lineage into Create metadata")
 	}
 	if _, ok := snapshot.Metadata[sandboxcfg.NsCredentials]; ok {
 		t.Fatal("live snapshot leaked source credentials")
@@ -78,6 +88,12 @@ esac
 	raw, err := os.ReadFile(argsFile)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "--ref-location-parent\n"+cfg.Checkpoint.Remote.RefLocationParent+"\n") {
+		t.Fatal("input namespace lost")
+	}
+	if strings.Contains(string(raw), "--to-ref-location\n") != (target == "location") {
+		t.Fatal("wrong snapshot destination")
 	}
 	if !strings.Contains(string(raw), "--resume\n") || !strings.Contains(string(raw), "fork-publish\n") {
 		t.Fatal("capture consumed parent or skipped publish")

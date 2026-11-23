@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodepath"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -22,6 +23,7 @@ func (o *Orchestrator) cleanupCheckpoint(ctx context.Context, sb *types.Sandbox)
 }
 
 func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types.Sandbox, inspect bool) ([]artifact.DiffCheckpointRef, error) {
+	started := time.Now()
 	source := sb.ResumeSource
 	if source.Empty() || types.IsPortableRef(source.Ref) {
 		return nil, nil
@@ -78,15 +80,18 @@ func (o *Orchestrator) inspectOrCleanupCheckpoint(ctx context.Context, sb *types
 	if inspect {
 		args = append(args, "--list-versions")
 	}
-	cmd := exec.CommandContext(ctx, o.executables.OrchestratorCtl(), args...)
+	cmd := exec.CommandContext(ctx, o.executables.CheckpointCtl(), args...)
 	inheritSourceOperation(ctx, cmd)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var stderr, stdout bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.Stdout = &stdout
+	o.log.Info("checkpoint cleanup phase", "sid", sb.ID, "stage", "prepare", "duration_ms", float64(time.Since(started))/1e6)
+	started = time.Now()
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("orch: checkpoint inspection/cleanup %s: %w: %s", sb.ID, err, stderr.String())
 	}
+	o.log.Info("checkpoint cleanup phase", "sid", sb.ID, "stage", "tool", "duration_ms", float64(time.Since(started))/1e6, "detail", stderr.String())
 	var refs []artifact.DiffCheckpointRef
 	if inspect {
 		if err := json.Unmarshal(stdout.Bytes(), &refs); err != nil {

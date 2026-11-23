@@ -25,7 +25,20 @@ type SlotMaterial struct {
 }
 
 func ExportSlotMaterial(ctx context.Context, spec configsock.ArtifactPrepareSpec) (json.RawMessage, error) {
-	access, err := preparedCacheFor(spec)
+	material, err := PrepareSlotMaterial(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	if material == nil {
+		return nil, nil
+	}
+	return json.Marshal(material)
+}
+
+// PrepareSlotMaterial preserves the same authenticated cache and physical-file
+// checks as the legacy exporter, without serializing inside the shared host.
+func PrepareSlotMaterial(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*SlotMaterial, error) {
+	access, err := preparedCacheForContext(ctx, spec)
 	if err != nil || access == nil {
 		return nil, err
 	}
@@ -36,7 +49,7 @@ func ExportSlotMaterial(ctx context.Context, spec configsock.ArtifactPrepareSpec
 	if _, err := consumePreparedEntry(ctx, spec, entry); err != nil {
 		return nil, err
 	}
-	return json.Marshal(SlotMaterial{Request: spec, RootSandboxRef: spec.RootSandboxRef, Identity: access.aad, Entry: *entry})
+	return &SlotMaterial{Request: spec, RootSandboxRef: spec.RootSandboxRef, Identity: access.aad, Entry: *entry}, nil
 }
 
 func (s *SlotMaterial) Claim(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, bool, error) {
@@ -51,7 +64,7 @@ func (s *SlotMaterial) Claim(ctx context.Context, spec configsock.ArtifactPrepar
 		}
 		identitySpec.RootSandboxRef = s.RootSandboxRef
 	}
-	access, err := preparedCacheFor(identitySpec)
+	access, err := preparedCacheForContext(ctx, identitySpec)
 	if err != nil {
 		return nil, false, err
 	}

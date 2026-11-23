@@ -198,3 +198,16 @@ func clonePtr[T any](in *T) *T {
 	out := *in
 	return &out
 }
+
+// CheckpointCtl only selects a companion in the configured distribution. It
+// never searches PATH for an optional helper. Missing helpers retain legacy
+// deployments; an existing but broken helper must fail, not retry mutation.
+func (e Executables) CheckpointCtl() string {
+	if e.dir != "" {
+		p := filepath.Join(e.dir, "node-checkpoint")
+		if _, err := os.Lstat(p); err == nil || !os.IsNotExist(err) {
+			return p
+		}
+	}
+	return e.OrchestratorCtl()
+}

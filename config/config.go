@@ -414,6 +414,7 @@ func (c MMDSConfig) ServiceEndpoints() map[string]string {
 
 // PathsConfig holds node-local directories and sockets.
 type PathsConfig struct {
+	RunnerExecutable    string `yaml:"runner_executable,omitempty" json:"runner_executable,omitempty"`       // optional lightweight node-runner; empty preserves node-ctl runner
 	ConductorExecutable string `yaml:"conductor_executable,omitempty" json:"conductor_executable,omitempty"` // custom conductor binary; empty uses node-ctl's built-in app
 	RunRoot             string `yaml:"run_root" json:"run_root"`                                             // default /run/sandbox (tmpfs)
 	BaseRoot            string `yaml:"base_root" json:"base_root"`                                           // default /var/lib/sandbox (persistent)
@@ -902,10 +903,12 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 // Sandbox BaseDir/checkpoint; MergeRef and DropCaches apply only to
 // CaptureSnapshot and override sandbox-ctl's snapshot defaults when set.
 type CheckpointConfig struct {
-	Mode       string                 `yaml:"mode" json:"mode"`               // local (default) | bundle
-	MergeRef   *bool                  `yaml:"merge_ref" json:"merge_ref"`     // nil delegates to sandbox-ctl
-	DropCaches *bool                  `yaml:"drop_caches" json:"drop_caches"` // nil delegates to sandbox-ctl
-	Remote     CheckpointRemoteConfig `yaml:"remote" json:"remote"`
+	// SnapshotTarget selects running-snapshot publication without changing input location resolution.
+	SnapshotTarget string                 `yaml:"snapshot_target" json:"snapshot_target,omitempty"` // empty: existing destination; location | manifest
+	Mode           string                 `yaml:"mode" json:"mode"`                                 // local (default) | bundle
+	MergeRef       *bool                  `yaml:"merge_ref" json:"merge_ref"`                       // nil delegates to sandbox-ctl
+	DropCaches     *bool                  `yaml:"drop_caches" json:"drop_caches"`                   // nil delegates to sandbox-ctl
+	Remote         CheckpointRemoteConfig `yaml:"remote" json:"remote"`
 }
 
 type CheckpointRemoteConfig struct {
@@ -1143,6 +1146,9 @@ func ValidateConductorFinal(c *Conductor) error {
 	if c == nil {
 		return fmt.Errorf("config: conductor is required")
 	}
+	if c.Paths.RunnerExecutable != "" && !filepath.IsAbs(c.Paths.RunnerExecutable) {
+		return fmt.Errorf("config: paths.runner_executable must be absolute")
+	}
 	if c.Paths.ConductorExecutable != "" && !filepath.IsAbs(c.Paths.ConductorExecutable) {
 		return fmt.Errorf("config: paths.conductor_executable must be absolute")
 	}
@@ -1182,6 +1188,9 @@ func validateAdvertisedEndpoint(name, endpoint string) error {
 }
 
 func (c *Conductor) validateDeclarative() error {
+	if c.Paths.RunnerExecutable != "" && !filepath.IsAbs(c.Paths.RunnerExecutable) {
+		return fmt.Errorf("config: paths.runner_executable must be absolute")
+	}
 	for _, field := range []struct {
 		name  string
 		value *string
@@ -1285,6 +1294,15 @@ func (c *Conductor) validateDeclarative() error {
 	case CheckpointLocal, CheckpointBundle:
 	default:
 		return fmt.Errorf("config: checkpoint.mode %q (want local|bundle)", c.Checkpoint.Mode)
+	}
+	switch c.Checkpoint.SnapshotTarget {
+	case "", "manifest":
+	case "location":
+		if c.Checkpoint.Remote.RefLocationParent == "" {
+			return fmt.Errorf("config: checkpoint.snapshot_target=location requires ref_location_parent")
+		}
+	default:
+		return fmt.Errorf("config: invalid checkpoint.snapshot_target %q", c.Checkpoint.SnapshotTarget)
 	}
 	parent := c.Checkpoint.Remote.RefLocationParent
 	if c.Checkpoint.Remote.Manifest && parent == "" {

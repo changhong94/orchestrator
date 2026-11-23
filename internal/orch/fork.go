@@ -156,7 +156,7 @@ func (o *Orchestrator) withForkTemplate(ctx context.Context, key, id string, con
 	}
 	ref.Path = root
 	args = []string{"fork-publish", "--manifest-config", o.cfg.ManifestConfig, "--ref-location-parent", o.cfg.Checkpoint.Remote.RefLocationParent}
-	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
+	if o.cfg.Checkpoint.SnapshotTarget != "manifest" && o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		location := reflocation.PublicationName(captureID.String())
 		uri, err := o.cfg.Checkpoint.RefLocationURI(location)
 		if err != nil {
@@ -183,7 +183,7 @@ func (o *Orchestrator) withForkTemplate(ctx context.Context, key, id string, con
 	// cold-create mutations or reuse the parent's explicit management identity.
 	for _, name := range []string{sandboxcfg.NsIdentity, sandboxcfg.NsLaunch,
 		sandboxcfg.NsInit, sandboxcfg.NsMounts, sandboxcfg.NsFiles,
-		sandboxcfg.NsCredentials, sandboxcfg.NsMMDS} {
+		sandboxcfg.NsCredentials, sandboxcfg.NsMMDS, nativeForkParentKey} {
 		delete(metadata, name)
 	}
 	restore := map[string]any{}

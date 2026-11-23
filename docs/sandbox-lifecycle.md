@@ -1225,3 +1225,24 @@ ownership, checks one runtime spawn, and deletes a still-blocked accepted attemp
 E/S preparation precedes VM creation; the Sandboxer recovery case separately
 proves VM survival across post-ACK and ordinary-read failures. Record the actual
 selected SDK and Guest Bundle, not just a successful local relative replace build.
+
+### Running snapshots and publication destination
+
+`POST /sandboxes/{id}/snapshots` captures a running sandbox and returns a reusable
+`templateID` plus restore metadata. It uses the same capture and durability barriers
+as snapshot-backed fork. The returned metadata excludes the host-owned native-fork
+lineage: restoring a saved snapshot creates a new independent execution, not an
+attachment to the original live RAM owner.
+
+`checkpoint.snapshot_target` selects this running-snapshot publication destination:
+
+- Empty: retain the existing destination selection.
+- `location`: publish to `checkpoint.remote.ref_location_parent` (required).
+- `manifest`: publish the complete snapshot dependency graph to Manifest Store,
+  including located file dependencies. The location parent still resolves inputs;
+  it no longer selects the output destination in this mode.
+
+This setting does not change `checkpoint.mode=local|bundle` (the capture carrier),
+or the ordinary pause checkpoint's ownership and location. Manifest publication
+commits dependencies before the root; it must succeed before the API returns a
+reusable template. The source may resume earlier after the capture barrier.

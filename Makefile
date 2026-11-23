@@ -42,7 +42,7 @@ endef
 all: build
 
 # `build` ships the control-plane binaries.
-build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
+build: node-ctl node-checkpoint node-runner node-vm-runner node-run-lease cluster-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
@@ -56,6 +56,24 @@ node-ctl:
 	@mkdir -p "$(BINDIR)"
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-ctl" ./cmd/node-ctl
 	$(call link_bin,node-ctl)
+
+# The VM holder uses exactly the same runner implementation as node-ctl without
+# initializing unrelated control-plane packages in every reserve slot.
+RUNNER_SOURCES := runner_entry.go runner_main.go run_sandbox.go taskrun.go prepared_vm.go \
+	prepared_codecs.go stage_catalog.go runner_cgroup.go runner_metrics.go launch_stages.go shared_controller.go shared_run.go approved_executable.go shared_listener.go
+.PHONY: node-runner
+node-runner:
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-runner" $(addprefix ./cmd/node-ctl/,$(RUNNER_SOURCES))
+	$(call link_bin,node-runner)
+
+# Optional single-VM holder/controller. Keep the default node-runner light.
+.PHONY: node-vm-runner
+node-vm-runner:
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-vm-runner" $(addprefix ./cmd/node-ctl/,$(subst runner_entry.go,vm_runner_entry.go,$(RUNNER_SOURCES)))
+	$(call link_bin,node-vm-runner)
+
 
 # cluster-ctl: the cluster control plane (registry / router / placer, cluster.md).
 cluster-ctl:
@@ -145,3 +163,16 @@ help:
 	@echo "  release                    build a validated orchestrator component bundle"
 	@echo "  test-release               test orchestrator component packaging"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
+
+.PHONY: node-run-lease
+node-run-lease:
+	mkdir -p "$(BINDIR)"
+	$(CC) -O2 -Wall -Wextra -Werror -o "$(BINDIR)/node-run-lease" cmd/node-run-lease/main.c
+	$(call link_bin,node-run-lease)
+
+# Same tenant-isolated cleanup CLI, without conductor/proxy initialization.
+.PHONY: node-checkpoint
+node-checkpoint:
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-checkpoint" ./cmd/node-ctl/checkpoint_entry.go ./cmd/node-ctl/checkpoint.go
+	$(call link_bin,node-checkpoint)

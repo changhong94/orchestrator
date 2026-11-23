@@ -13,9 +13,9 @@ import (
 
 	conductorextension "github.com/kuasar-sandbox/orchestrator/app/conductor/extension"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
-	"github.com/kuasar-sandbox/orchestrator/internal/proxystats"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/strictjson"
+	"github.com/kuasar-sandbox/orchestrator/internal/telemetryview"
 )
 
 const PathTelemetryStats = "/internal/plugin/telemetry/stats"
@@ -89,7 +89,7 @@ func (s *Server) handleTelemetryStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !holdAware {
-		ctx = proxystats.WithPhysicalTelemetry(ctx)
+		ctx = telemetryview.WithPhysical(ctx)
 	}
 	rows, err := s.deps.Stats.ReadStats(ctx, request)
 	if ctx.Err() != nil || lease.Err() != nil {

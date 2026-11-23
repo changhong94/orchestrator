@@ -1171,3 +1171,16 @@ telemetry endpoint, a failed UDS request or unavailable query backend gives 503.
 Client cancellation reaches the HTTP UDS request and backend query. Queries never
 call Wake, Resume, import, reservation or guest control APIs; paused history is
 read without touching the sandbox.
+
+With `KUASAR_STORE_TIMING` enabled, `STORE_ADMISSION` separates connection queue,
+SQLite writer acquisition, transaction work and durable commit. `STORE_WAL`
+reports passive checkpoint duration and WAL/copied frame counts. The node store
+uses a separate maintenance connection every 250 ms, following the original
+fork adapter's background WAL maintenance. This copies already committed frames
+to the database; it does not make commits asynchronous. Every writer retains
+`synchronous=FULL` and SQLite's default 1000-frame automatic checkpoint fallback.
+Pinned readers can defer checkpoint progress; passive maintenance does not wait
+for them or discard the WAL. Shutdown joins maintenance before closing the store.
+A slow commit alone cannot distinguish WAL sync from an automatic checkpoint;
+compare phase logs and checkpoint evidence rather than attributing all tail
+latency to either operation. Ten samples do not establish a tail percentile.

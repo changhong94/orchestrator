@@ -31,8 +31,7 @@ func HTTPClientWithTimeout(socket string, timeout time.Duration) *http.Client {
 			// responses from a restarting or temporarily unhealthy controller.
 			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", socket)
+				return delegatedDial(ctx, socket)
 			},
 		},
 	}

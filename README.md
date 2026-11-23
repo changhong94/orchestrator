@@ -84,6 +84,7 @@ For security architecture and deployment trust boundaries, see the [project syst
 | `node-ctl proxy serve` | Start the node data-plane proxy master/worker |
 | `node-ctl telemetry serve` | Start sandbox metrics collection and history queries |
 | `node-ctl run-sandbox` | Launch one sandbox inside its managed unit |
+| `node-runner run-sandbox` | Use the same sandbox launcher without loading conductor, cluster, proxy and telemetry packages in each slot |
 | `node-ctl run-builder` | Launch one template-build execution |
 | `node-ctl resource ...` | Inspect or drain node resource reservations |
 | `node-ctl builder status` | Inspect build execution state |
@@ -98,6 +99,80 @@ checkpoint cleanup may finish later. Same-ID Create/import conflicts until clean
 completes. `--keep-source` preserves the source. See the [node export/import contract](docs/sandbox-lifecycle.md#export-import-command).
 
 The repository also builds `node-stub-ctl`, an E2E helper that simulates node-link participants without starting MicroVMs.
+
+For a memory-conscious prepared pool, build and install `node-runner` with
+`make node-runner`, then set `paths.runner_executable` to its absolute path.
+Generated sandbox runner units use that executable; builder units and the node
+services continue to use `node-ctl`. Deployments managing their own units must
+also update the sandbox unit's `ExecStart`. This uses the same session fence,
+artifact authorization, durable assignment, readiness and teardown code, with
+one holder process per VM. It does not consolidate VM controllers into a shared
+daemon. An unset path preserves the original runner executable. Temporary
+preparation buffers are reclaimed before publishing a prepared slot as ready;
+include this work in pool preparation/refill measurements.
+
+Prepared slots can also use one combined holder/controller process. Build
+`node-vm-runner` (`make node-vm-runner`) and `sandbox-ctl` from the same sandboxer workspace revision,
+install both, set `paths.runner_executable` (and any custom unit ExecStart) to
+`node-vm-runner`, and explicitly set `KUASAR_EMBEDDED_SANDBOX_SHA256` in the runner
+unit to the installed `sandbox-ctl` SHA-256. The digest is checked during slot
+preparation; a mismatch fails preparation rather than silently running a
+substituted controller. Without this opt-in the subprocess path is unchanged.
+The CLI engine lives in sandboxer's `app/ctl`; `cmd/sandbox-ctl` remains its
+standalone entry point. There is still one Go process per VM, never a shared
+multi-tenant environment or a fork of a Go process. Private descriptors are
+duplicated with CLOEXEC and transferred with a single owner; preparation,
+authorization and durable launch acknowledgment are unchanged. Cancellation
+joins runtime cleanup before reporting completion. If cleanup hangs past the
+existing five-second escalation bound, the single-VM holder fails closed.
+Cold runners and native running-parent fork children retain the standalone
+controller path. This does not change disk persistence or guest RAM CoW.
+
+An alternative shared-controller mode covers prepared slots, cold starts and
+children of a running-parent fork. Build `node-runner`, `node-vm-runner`,
+`node-run-lease` and the matching `sandbox-ctl`. Run
+`node-vm-runner shared-runs /absolute/private/runs.sock` in its own service,
+with a root-only parent directory. Instance units invoke
+`node-runner register-shared` with their usual `--pidfile`, `--config-socket`
+and `--run-id`, and set `KUASAR_SHARED_RUN_SOCKET` and
+`KUASAR_NATIVE_RUN_PROXY` to absolute paths. Keep the embedded sandbox digest
+check and bind instance units to the shared-controller service lifecycle.
+The initial Go registrar execs the native lease process at the same PID; there
+is no resident per-instance Go proxy. The native process retains the instance
+PID lock and opens authorization connections, so the existing config-socket
+peer-credential check still sees the instance PID, not a controller allowlist.
+
+In shared mode, prepared catalog metadata transfers directly as privately owned
+Go values. Legacy subprocess mode retains the sealed descriptor transport.
+Catalog count/size admission, key-bound identity, physical file-version checks,
+one-use claiming and durable publication remain enforced. Budget checks still
+encode metadata; the shared path removes redundant wire encoding/decoding and
+memfd transport, not every JSON operation. Mutable restore plans and disk state
+are never shared between instances. After final CH state files are published,
+preparation-only JSON references are released; memory/disk source handles and
+cleanup ownership remain live for the VM lifetime. This remains one generic VM pool, not one
+VM pool per image. Shared mode does not support host interactive stdio; guest
+exec remains supported. A shared-controller crash is a common failure domain;
+its dependent instance units must stop rather than leave unmanaged VMs.
+The controller uses an exclusive endpoint lock and only removes an owned stale
+socket, so an unclean exit cannot block restart or evict a live controller.
+Use `Restart=on-failure`. Restart rebuilds empty pool resources; it does not
+reconstruct unsaved guest RAM. Recover workloads from committed checkpoints.
+The shared process caches executable digest verification only for the same
+expected digest and unchanged inode, size, mode, mtime and ctime; mutable
+execution state and authorization remain instance-owned.
+
+For preparation memory diagnostics only, set `KUASAR_MEMORY_TRACE=1` in the
+runner unit. `SLOT_MEMORY` JSON records include stage, PID/TID, Go allocator
+counters, `/proc/self/smaps_rollup` and sampling cost. Sampling does not force
+GC; the existing preparation GC is logged before/after. Optional
+`KUASAR_MEMORY_PROFILE_DIR` writes a private `heap-PID.pprof` at holder readiness.
+Use a separate profiling pass: generating heap profiles allocates memory and
+must not contaminate the steady-pool memory measurement. Trace-enabled runs
+are diagnostics, not startup latency benchmarks. Record host cgroup file cache
+separately from PSS and count shared controller processes only once.
+
+
 
 <a id="profiles"></a>
 
