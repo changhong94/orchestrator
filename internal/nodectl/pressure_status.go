@@ -26,17 +26,25 @@ type SandboxPressureStatus struct {
 	WaitingSinceUnixNano int64  `json:"waiting_since_unix_nano,omitempty"`
 }
 
+type PreparationTiming struct {
+	RunID           string `json:"run_id"`
+	StartedUnixNano int64  `json:"started_unix_ns"`
+	ReadyUnixNano   int64  `json:"ready_unix_ns"`
+	ElapsedNano     int64  `json:"elapsed_ns"`
+}
+
 type RunnerPoolStatus struct {
-	Kind         string         `json:"kind"`
-	Name         string         `json:"name"`
-	ResourcePool string         `json:"resource_pool"`
-	Unit         string         `json:"unit"`
-	IdleTarget   int            `json:"idle_target"`
-	Capacity     *int           `json:"capacity"` // null is unlimited
-	Priority     int            `json:"priority"`
-	Total        int            `json:"total"`
-	Reserved     int            `json:"reserved"` // effective starts not covered by an idle/starting instance
-	States       map[string]int `json:"states"`
+	PreparationHistory []PreparationTiming `json:"preparation_history,omitempty"`
+	Kind               string              `json:"kind"`
+	Name               string              `json:"name"`
+	ResourcePool       string              `json:"resource_pool"`
+	Unit               string              `json:"unit"`
+	IdleTarget         int                 `json:"idle_target"`
+	Capacity           *int                `json:"capacity"` // null is unlimited
+	Priority           int                 `json:"priority"`
+	Total              int                 `json:"total"`
+	Reserved           int                 `json:"reserved"` // effective starts not covered by an idle/starting instance
+	States             map[string]int      `json:"states"`
 }
 
 type PressureOperationResult struct {

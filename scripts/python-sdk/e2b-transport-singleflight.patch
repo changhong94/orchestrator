@@ -1,18 +1,9 @@
 --- a/e2b/api/client_sync/__init__.py
 +++ b/e2b/api/client_sync/__init__.py
-@@ -9,6 +9,8 @@
- 
- logger = logging.getLogger(__name__)
- 
-+_transport_init_lock = threading.Lock()
+@@ -10,0 +11,2 @@
 +
- 
- def get_api_client(config: ConnectionConfig, **kwargs) -> ApiClient:
-     return ApiClient(
-@@ -41,13 +43,21 @@
-     if cached is not None:
-         return cached
- 
++_transport_init_lock = threading.Lock()
+@@ -44,7 +46,15 @@
 -    transport = TransportWithLogger(
 -        limits=limits,
 -        proxy=config.proxy,
@@ -28,13 +19,42 @@
 +        if cached is not None:
 +            return cached
 +        transport = TransportWithLogger(
++            verify=_get_default_ssl_context(http2),
 +            limits=limits,
 +            proxy=config.proxy,
 +            http2=http2,
 +        )
 +        TransportWithLogger._instances[http2] = transport
 +        return transport
+@@ -51,0 +62,29 @@
 +
- 
- 
- class EnvdTransportWithLogger(TransportWithLogger):
++
++
++# Envd connection pools remain thread-local. Only the default, verified trust
++# context is shared, lazily inside the first API/command request. An explicit trust
++# environment keeps HTTPX's original construction policy.
++_default_tls_lock = threading.Lock()
++_default_tls_contexts = {}
++
++def _get_default_ssl_context(http2):
++    import os
++    import certifi
++    from httpx._config import create_ssl_context
++    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
++        return create_ssl_context()
++    ca = os.path.realpath(certifi.where())
++    st = os.stat(ca)
++    key = (http2, ca, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
++    with _default_tls_lock:
++        cached = _default_tls_contexts.get(key)
++        if cached is not None:
++            return cached
++        context = create_ssl_context(trust_env=False)
++        # Never cache a failed construction. Bound cache retention when the
++        # CA bundle is replaced; existing transports keep their own references.
++        if len(_default_tls_contexts) >= 4:
++            _default_tls_contexts.clear()
++        _default_tls_contexts[key] = context
++        return context
+@@ -67,0 +107 @@
++        verify=_get_default_ssl_context(http2),

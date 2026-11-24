@@ -1,6 +1,6 @@
 Shared sandbox controller (opt-in)
 
-Build node-runner, node-vm-runner, node-run-lease and sandbox-ctl from the same
+Build node-register, node-runner, node-vm-runner, node-run-lease and sandbox-ctl from the same
 workspace. The native lease helper uses CC; when cross-compiling, CC must target
 the same architecture as the Go binaries. Deploy all matching binaries.
 
@@ -8,7 +8,7 @@ node-vm-runner shared-runs owns the complete per-run lifecycle: prepared slots,
 artifact preparation, assignment, cold launch, running-parent fork child launch,
 readiness and durable result reporting. There is one shared Go VM controller.
 Each unit keeps a small native node-run-lease process, not a Go runtime.
-The initial node-runner register-shared locks the PID file, sets up the delegated
+The minimal node-register register-shared locks the PID file, sets up the delegated
 cgroup, seals registration in a memfd and execs node-run-lease with the same PID.
 The POSIX PID lock survives exec; no Go heap remains in the instance process.
 
@@ -21,7 +21,8 @@ BindsTo=shared-vm-controller.service
 Environment=KUASAR_SHARED_RUN_SOCKET=/run/kuasar-shared-controller/runs.sock
 Environment=KUASAR_NATIVE_RUN_PROXY=/usr/bin/node-run-lease
 Environment=KUASAR_EMBEDDED_SANDBOX_SHA256=<sha256 of matching sandbox-ctl>
-# ExecStart must invoke node-runner register-shared, not run-sandbox.
+# ExecStart invokes node-register register-shared with the same arguments.
+# Legacy node-runner register-shared remains compatible but initializes more Go code.
 
 Use a root-owned mode0700 socket directory and deployment-specific storage/cache
 settings in the controller service. Host launch paths must be absolute; instances
@@ -58,3 +59,29 @@ Account allocated cache disk and page-cache residency separately from process
 PSS. Cold cache faults can still require disk IO, as with the old fork.
 Without CACHE_DIR the legacy tmpfs cache remains supported, but it can swap and
 is not a guarantee of warm physical memory. No memlock allowance is required.
+
+Pool preparation startup ordering:
+The conductor service may declare Wants=shared-vm-controller.service (without
+After). This initializes the same shared controller concurrently with conductor
+startup, before the first pool wave needs it. Runner Requires/After/BindsTo and
+all per-run authorization checks stay unchanged. Include both service startups
+in full-pool timing; do not report this work as free preparation.
+Set KUASAR_EMBEDDED_SANDBOX_SHA256 on the shared controller as well as runners
+when using startup integrity priming. It only primes the sibling sandbox-ctl;
+the assigned executable path, digest and current inode/version are still checked
+before every launch. Custom paths or changed files use normal verification.
+
+Controller scheduling and memory are separate from pool concurrency. On the
+88-CPU 113 benchmark host, the retained shared-controller setting is
+Environment=GOMAXPROCS=16 GOGC=100, while pool size remains64 and preparation/refill
+concurrency remains8. The previous 8-P controller showed runnable work queued
+behind validation/decode/GC; a more aggressive GOGC trial was not retained because tail latency regressed. Size these process settings for the host and validate
+both total memory (including file cache) and burst completion, not only latency.
+
+A shared-only runtime deployment can install the minimal node-register artifact
+at both node-register and node-runner via one hard-linked inode. Its runner
+units must exclusively invoke register-shared; it does not implement the legacy
+run-sandbox CLI. Keep the full node-runner build artifact in the deployment
+archive for switching back to per-process mode. This avoids caching an unused
+full bootstrap in the shared-only runtime; it does not remove the legacy source
+or build target. Count all deployed executable cache pages in memory comparison.

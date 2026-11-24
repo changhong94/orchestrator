@@ -14,7 +14,9 @@ class TransportInitTests(unittest.TestCase):
    with concurrent.futures.ThreadPoolExecutor(64)as pool:results=list(pool.map(get,range(64)))
   self.assertEqual(len(calls),1)
   self.assertTrue(all(x is results[0]for x in results))
-  self.assertNotIn('verify',calls[0]) # keep HTTPX certificate verification default
+  import ssl
+  self.assertTrue(calls[0]['verify'].check_hostname)
+  self.assertEqual(calls[0]['verify'].verify_mode,ssl.CERT_REQUIRED)
  def test_failed_initialization_can_retry(self):
   calls=[]
   def init(self,*a,**kw):

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
@@ -115,19 +116,23 @@ func (p *runPools) hasSupply(resourcePool string) bool {
 // units survive handoff and are released by the existing ownership lifecycle.
 // Durable identities include idle, starting and assigned instances on restart.
 type runIndex struct {
-	mu       sync.Mutex
-	retireMu sync.Mutex // never hold mu while calling the resource controller
-	waiting  map[string]*runPool
-	units    map[string]string
-	owners   map[string]*runPool
-	metadata map[string]store.RunPoolOwnership
-	states   map[string]string
-	retiring map[string]time.Time
-	persist  func(store.RunPoolOwnership) error
-	erase    func(store.RunPoolOwnership) error
+	preparationStarts  map[string]time.Time
+	preparationHistory map[string][]nodectl.PreparationTiming
+	mu                 sync.Mutex
+	retireMu           sync.Mutex // never hold mu while calling the resource controller
+	waiting            map[string]*runPool
+	units              map[string]string
+	owners             map[string]*runPool
+	metadata           map[string]store.RunPoolOwnership
+	states             map[string]string
+	retiring           map[string]time.Time
+	persist            func(store.RunPoolOwnership) error
+	erase              func(store.RunPoolOwnership) error
 }
 
 func (r *runIndex) register(runID string, p *runPool) error {
+	traceStart := time.Now()
+	defer func() { poolStage(runID, "register", traceStart) }()
 	if r == nil {
 		return nil
 	}
@@ -165,6 +170,10 @@ func (r *runIndex) register(runID string, p *runPool) error {
 	if r.states == nil {
 		r.states = map[string]string{}
 	}
+	if r.preparationStarts == nil {
+		r.preparationStarts = make(map[string]time.Time)
+	}
+	r.preparationStarts[runID] = time.Now()
 	r.states[runID] = "starting"
 	r.owners[runID], r.metadata[runID] = p, m
 	r.waiting[runID], r.units[runID] = p, p.unitName(runID)
@@ -196,6 +205,26 @@ func (r *runIndex) markState(runID, state string) {
 	defer r.mu.Unlock()
 	if r.states == nil {
 		r.states = map[string]string{}
+	}
+	if start, ok := r.preparationStarts[runID]; ok && state == "idle" {
+		now := time.Now()
+		owner := r.owners[runID]
+		if owner != nil {
+			if r.preparationHistory == nil {
+				r.preparationHistory = make(map[string][]nodectl.PreparationTiming)
+			}
+			key := owner.kind + "/" + owner.name
+			h := r.preparationHistory[key]
+			if len(h) >= 4096 {
+				copy(h, h[1:])
+				h = h[:4095]
+			}
+			r.preparationHistory[key] = append(h, nodectl.PreparationTiming{RunID: runID, StartedUnixNano: start.UnixNano(), ReadyUnixNano: now.UnixNano(), ElapsedNano: now.Sub(start).Nanoseconds()})
+		}
+		delete(r.preparationStarts, runID)
+	}
+	if state == "stopping" {
+		delete(r.preparationStarts, runID)
 	}
 	r.states[runID] = state
 	if state == "stopping" {

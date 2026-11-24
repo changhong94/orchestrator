@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -53,6 +54,14 @@ func prepareTaskCgroupAt(
 	moveSelf func(string) error,
 	validate func(*os.File) error,
 ) (*os.File, error) {
+	last := time.Now()
+	mark := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=registration run=%s stage=%s us=%d end_ns=%d\n", runID, stage, now.Sub(last).Microseconds(), now.UnixNano())
+			last = now
+		}
+	}
 	identity, err := readIdentity()
 	if err != nil {
 		return nil, fmt.Errorf("read runner cgroup identity: %w", err)
@@ -69,6 +78,7 @@ func prepareTaskCgroupAt(
 	if err := ensurePathWithin(root, unitRoot); err != nil {
 		return nil, err
 	}
+	mark("identity")
 	ctlPath := filepath.Join(unitRoot, "ctl")
 	if alreadyPlaced {
 		ctlInfo, err := os.Stat(ctlPath)
@@ -106,6 +116,7 @@ func prepareTaskCgroupAt(
 		return nil, fmt.Errorf("runner unit root: %w", err)
 	}
 
+	mark("placement")
 	controllers, err := os.ReadFile(filepath.Join(unitRoot, "cgroup.controllers"))
 	if err != nil {
 		return nil, fmt.Errorf("read delegated controllers: %w", err)
@@ -127,12 +138,14 @@ func prepareTaskCgroupAt(
 			commands = append(commands, "+"+controller)
 		}
 	}
+	mark("controller_read")
 	if len(commands) > 0 {
 		if err := writeExistingFile(filepath.Join(unitRoot, "cgroup.subtree_control"), strings.Join(commands, " ")); err != nil {
 			return nil, fmt.Errorf("enable runner controllers: %w", err)
 		}
 	}
 
+	mark("controller_enable")
 	vmmPath := filepath.Join(unitRoot, "vmm")
 	if err := os.Mkdir(vmmPath, 0o755); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("create vmm cgroup: %w", err)
@@ -155,6 +168,7 @@ func prepareTaskCgroupAt(
 			return nil, err
 		}
 	}
+	mark("vmm_cgroup")
 	return f, nil
 }
 

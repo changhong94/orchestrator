@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"sync"
@@ -23,7 +25,9 @@ type executableProof struct {
 
 var approvedExecutables struct {
 	sync.Mutex
-	proofs map[executableProof]struct{}
+	proofs           map[executableProof]struct{}
+	watchFD          int
+	watchInitialized bool
 }
 
 // Only shared hosts cache a proof. Every use opens and stats the current file;
@@ -57,13 +61,17 @@ func verifyExecutable(path, expected string, shared bool) error {
 	if shared {
 		approvedExecutables.Lock()
 		defer approvedExecutables.Unlock()
+		// Timestamps can collide for same-size writes within one filesystem
+		// clock tick, even if mtime is restored. Watch the opened inode before
+		// consulting the cache; unavailable notification falls back to hashing.
+		shared = watchExecutableChanges(f)
 		current, e := version()
 		if e != nil {
 			return e
 		}
 		before = current
 		proof = executableProof{before, expected}
-		if _, ok := approvedExecutables.proofs[proof]; ok {
+		if _, ok := approvedExecutables.proofs[proof]; shared && ok {
 			return nil
 		}
 	}
@@ -88,4 +96,45 @@ func verifyExecutable(path, expected string, shared bool) error {
 		approvedExecutables.proofs[proof] = struct{}{}
 	}
 	return nil
+}
+
+// Called under approvedExecutables.Mutex. One nonblocking descriptor covers
+// the small process-wide executable cache. Any mutation invalidates all proofs;
+// overflow and watch errors cannot leave a reusable proof behind.
+func watchExecutableChanges(f *os.File) bool {
+	if !approvedExecutables.watchInitialized {
+		approvedExecutables.watchInitialized = true
+		fd, err := unix.InotifyInit1(unix.IN_NONBLOCK | unix.IN_CLOEXEC)
+		if err != nil {
+			approvedExecutables.watchFD = -1
+		} else {
+			approvedExecutables.watchFD = fd
+		}
+	}
+	fd := approvedExecutables.watchFD
+	if fd < 0 {
+		return false
+	}
+	_, err := unix.InotifyAddWatch(fd, fmt.Sprintf("/proc/self/fd/%d", f.Fd()), unix.IN_MODIFY|unix.IN_ATTRIB|unix.IN_CLOSE_WRITE|unix.IN_DELETE_SELF|unix.IN_MOVE_SELF)
+	if err != nil {
+		approvedExecutables.proofs = nil
+		return false
+	}
+	var buf [4096]byte
+	for {
+		n, err := unix.Read(fd, buf[:])
+		if n > 0 {
+			approvedExecutables.proofs = nil
+		}
+		if err == unix.EAGAIN {
+			return true
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || n == 0 {
+			approvedExecutables.proofs = nil
+			return false
+		}
+	}
 }

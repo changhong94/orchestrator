@@ -16,6 +16,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+ "os"
+ "time"
 	"strconv"
 	"strings"
 
@@ -309,6 +311,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid, port, ok := ParseSandbox(r)
+ if os.Getenv("KUASAR_EXEC_PHASE_TRACE") == "1" && strings.HasSuffix(r.URL.Path,"/process.Process/Start") {
+  fmt.Fprintf(os.Stderr,"EXEC_PHASE sid=%s stage=received ns=%d\n",sid,time.Now().UnixNano())
+  w = &execPhaseWriter{ResponseWriter:w,sid:sid}
+ }
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
@@ -343,6 +349,7 @@ func (p *Proxy) ForwardAuthorized(w http.ResponseWriter, r *http.Request, reques
 // parking/activation/dial/transport lifecycle; native exec has its own admission.
 func (p *Proxy) forwardRoute(w http.ResponseWriter, r *http.Request, binding RouteBinding, request AuthorizedForwardRequest) {
 	route, flow, ok := p.activateRoute(w, r, binding)
+ if t,yes:=w.(*execPhaseWriter);yes{t.phase("route_active")}
 	if !ok {
 		return
 	}
@@ -367,7 +374,8 @@ func (p *Proxy) forwardRoute(w http.ResponseWriter, r *http.Request, binding Rou
 		}
 		defer stop()
 	}
-	backend = flow.AttachBackend(backend)
+	if t,yes:=w.(*execPhaseWriter);yes{t.phase("backend_connected")}
+ backend = flow.AttachBackend(backend)
 	if r.Method == http.MethodConnect {
 		// H2 stream cancellation closes its backend independently of limits.
 		// An H1 CONNECT EOF may instead be a valid half-close.
@@ -579,3 +587,14 @@ func writeProxyError(w http.ResponseWriter, status int, msg, kind string) {
 	}
 	http.Error(w, msg, status)
 }
+
+// Optional byte-count-only diagnostics: never log command bodies or credentials.
+type execPhaseWriter struct { http.ResponseWriter; sid string; seq int }
+func (w *execPhaseWriter) Unwrap() http.ResponseWriter {return w.ResponseWriter}
+func (w *execPhaseWriter) phase(name string) {fmt.Fprintf(os.Stderr,"EXEC_PHASE sid=%s stage=%s ns=%d\n",w.sid,name,time.Now().UnixNano())}
+func (w *execPhaseWriter) Write(p []byte)(int,error) {
+ n,e:=w.ResponseWriter.Write(p)
+ if w.seq<8 {fmt.Fprintf(os.Stderr,"EXEC_PHASE sid=%s stage=write seq=%d bytes=%d ns=%d\n",w.sid,w.seq,n,time.Now().UnixNano())};w.seq++
+ return n,e
+}
+func (w *execPhaseWriter) Flush(){_ = http.NewResponseController(w.ResponseWriter).Flush()}

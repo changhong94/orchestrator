@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Create a private E2B SDK overlay; never modify a shared SDK installation.
 
-Only the concurrent first-use transport race is patched. TLS verification,
-credentials, per-thread Envd transports, and API timeouts remain unchanged.
+Serializes concurrent API transport initialization and shares lazily initialized
+default TLS trust contexts. TLS verification, credentials, per-thread Envd
+connection pools, and API timeouts remain unchanged. Explicit SSL_CERT_FILE/DIR
+settings retain the original HTTPX context policy. Run with the target SDK Python.
 The target file hash pins the supported SDK input; unknown versions fail closed.
 """
 import argparse
@@ -18,6 +20,9 @@ def main():
     parser.add_argument('--source', type=Path, required=True, help='SDK root containing e2b/')
     parser.add_argument('--destination', type=Path, required=True, help='new private overlay directory')
     args = parser.parse_args()
+    from importlib.metadata import version
+    if version("httpx") != "0.28.1":
+        parser.error("HTTPX version mismatch: review SSL context semantics before applying")
     source = args.source.resolve()
     destination = args.destination.resolve()
     target = source / 'e2b/api/client_sync/__init__.py'
@@ -32,7 +37,7 @@ def main():
         parser.error('git is required to apply the reviewed patch')
     destination.mkdir(parents=True)
     shutil.copytree(source / 'e2b', destination / 'e2b', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    subprocess.run(['git', 'apply', str(patch.resolve())], cwd=destination, check=True)
+    subprocess.run(['git', 'apply', '--unidiff-zero', str(patch.resolve())], cwd=destination, check=True)
     print(f'Private SDK installed at {destination}. Put this directory first in PYTHONPATH.')
 
 if __name__ == '__main__':

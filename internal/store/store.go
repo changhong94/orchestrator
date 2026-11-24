@@ -1197,11 +1197,20 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 		}
 		source.Ref = derived[0]
 	}
+	mark, finish := admissionTiming("commit_running", expected.ID)
+	defer finish()
 	planEnc, err := s.encryptWorkspacePlan(expected)
 	if err != nil {
 		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `
+	mark("metadata_encode")
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	mark("connection_wait")
+	result, err := conn.ExecContext(ctx, `
 		UPDATE sandboxes SET state=?, launch_mode='', pause_reason='', resource_obligation=0, pressure_version=pressure_version+1, pressure_since_ns=0, running_since_ns=?, resume_source_kind=?, resume_source_ref=?, resume_sandbox_ref=?,metadata_json=?,workspace_plan_enc=?
 		 WHERE id=? AND state=? AND run_id=? AND launch_mode=? AND template_id=? AND created_unix=?
 		   AND sandbox_result_run_id=''
@@ -1209,6 +1218,7 @@ func (s *Store) CommitPreparedRunning(ctx context.Context, expected *types.Sandb
 		string(types.StateRunning), time.Now().UnixNano(), string(source.Kind), source.Ref, source.SandboxRef, mj(expected.Metadata), planEnc,
 		expected.ID, string(types.StateStarting), expected.RunID, string(expected.LaunchMode), expected.TemplateID, expected.CreatedUnix,
 		string(expected.ResumeSource.Kind), expected.ResumeSource.Ref, expected.ResumeSource.SandboxRef)
+	mark("update_and_durable_commit")
 	if err != nil {
 		return false, fmt.Errorf("store: commit prepared running sandbox %s: %w", expected.ID, err)
 	}

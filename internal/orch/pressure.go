@@ -536,7 +536,9 @@ func (o *Orchestrator) ResourcePressureStatus(ctx context.Context) (nodectl.Pres
 	}
 	p := o.memoryPressure.Load()
 	if p == nil {
-		return nodectl.PressureStatus{}, nil
+		out := nodectl.PressureStatus{}
+		out.RunnerPools, out.UnattributedRunners = o.runnerPoolStatus()
+		return out, nil
 	}
 	out := nodectl.PressureStatus{Enabled: true, PressureSnapshot: p.state.PressureSnapshot(), Pools: p.state.PoolSnapshots()}
 	out.RunnerPools, out.UnattributedRunners = o.runnerPoolStatus()

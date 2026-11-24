@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandboxer/pkg/controllease"
@@ -23,66 +22,6 @@ import (
 
 var launchSharedPrepared func(context.Context, string, string, []*os.File, []restore.StagedCatalog) (func(), <-chan error, int, int, error)
 var launchSharedRun func(context.Context, string, []string, []string, *os.File, *os.File) error
-
-type sharedRunRequest struct {
-	RunID, Pidfile, Socket string
-	Env                    []string
-}
-
-// The initial Go launcher execs a native lifetime/credential proxy. PID and
-// POSIX pidfile lock survive exec; no Go heap remains in the instance unit.
-func registerSharedRun(args []string) error {
-	fs := flag.NewFlagSet("register-shared", flag.ContinueOnError)
-	pidfile := fs.String("pidfile", "", "")
-	socket := fs.String("config-socket", "", "")
-	rid := fs.String("run-id", "", "")
-	if e := fs.Parse(args); e != nil {
-		return e
-	}
-	envDefault(pidfile, "TASK_PIDFILE")
-	envDefault(socket, "TASK_CONFIG_SOCKET")
-	envDefault(rid, "TASK_RUN_ID")
-	manager := os.Getenv("KUASAR_SHARED_RUN_SOCKET")
-	helper := os.Getenv("KUASAR_NATIVE_RUN_PROXY")
-	if !filepath.IsAbs(*pidfile) || !filepath.IsAbs(*socket) || !filepath.IsAbs(manager) || !filepath.IsAbs(helper) || *rid == "" {
-		return errors.New("absolute shared-run endpoints and run identity required")
-	}
-	lock, e := openLockedPidfile(*pidfile)
-	if e != nil {
-		return e
-	}
-	defer unix.Close(lock)
-	cg, e := prepareRunnerCgroup(*rid)
-	if e != nil {
-		return e
-	}
-	defer cg.Close()
-	raw, e := json.Marshal(sharedRunRequest{RunID: *rid, Pidfile: *pidfile, Socket: *socket, Env: os.Environ()})
-	if e != nil {
-		return e
-	}
-	defer clear(raw)
-	fd, e := unix.MemfdCreate("shared-run-registration", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
-	if e != nil {
-		return e
-	}
-	defer unix.Close(fd)
-	if _, e = unix.Write(fd, raw); e != nil {
-		return e
-	}
-	if _, e = unix.Seek(fd, 0, 0); e != nil {
-		return e
-	}
-	if _, e = unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_SEAL); e != nil {
-		return e
-	}
-	for _, n := range []int{fd, lock, int(cg.Fd())} {
-		if _, e = unix.FcntlInt(uintptr(n), unix.F_SETFD, 0); e != nil {
-			return e
-		}
-	}
-	return unix.Exec(helper, []string{helper, manager, *socket, strconv.Itoa(fd), strconv.Itoa(int(cg.Fd())), strconv.Itoa(lock)}, os.Environ())
-}
 
 type dialResult struct {
 	conn net.Conn
@@ -180,6 +119,16 @@ func (b *runBroker) dial(ctx context.Context) (net.Conn, error) {
 }
 
 func serveSharedRuns(ctx context.Context, path string) error {
+	if executable, err := os.Executable(); err == nil && len(os.Getenv("KUASAR_EMBEDDED_SANDBOX_SHA256")) == 64 {
+		done := make(chan struct{})
+		expected := os.Getenv("KUASAR_EMBEDDED_SANDBOX_SHA256")
+		go func() {
+			defer close(done)
+			_ = verifyExecutable(filepath.Join(filepath.Dir(executable), "sandbox-ctl"), expected, true)
+		}()
+		defer func() { <-done }()
+	}
+
 	l, closeListener, e := listenSharedRuns(path)
 	if e != nil {
 		return e
@@ -303,11 +252,36 @@ func serveSharedRun(parent context.Context, c *net.UnixConn) {
 	}
 }
 func runSharedTask(ctx context.Context, req sharedRunRequest, socket string, cg *os.File) error {
+	traceLast := time.Now()
+	trace := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=shared run=%s stage=%s us=%d end_ns=%d tid=%d\n", req.RunID, stage, now.Sub(traceLast).Microseconds(), now.UnixNano(), unix.Gettid())
+			traceLast = now
+		}
+	}
+	trace("authorized")
+	// The approved executable is normally beside this shared host. Start its
+	// read-only integrity work while the authenticated run session/spec RPCs
+	// are in flight. This is only a hint: embeddedLauncher still opens/stats
+	// the authoritative path and verifies its expected digest before launch.
+	// A changed inode/digest or a nonstandard deployment follows that path.
+	if executable, err := os.Executable(); err == nil {
+		done := make(chan struct{})
+		expected := instanceenv.Get(ctx, "KUASAR_EMBEDDED_SANDBOX_SHA256")
+		go func() {
+			defer close(done)
+			_ = verifyExecutable(filepath.Join(filepath.Dir(executable), "sandbox-ctl"), expected, true)
+		}()
+		defer func() { <-done }()
+	}
+
 	session, e := openRunSessionKeeper(ctx, socket, "sandbox", req.RunID)
 	if e != nil {
 		return e
 	}
 	defer session.Close()
+	trace("session_open")
 	prepared, e := startPreparedSandboxContext(ctx, socket, req.RunID, cg)
 	if e != nil {
 		return e
@@ -324,8 +298,10 @@ func runSharedTask(ctx context.Context, req sharedRunRequest, socket string, cg 
 			}
 		}()
 	}
+	trace("prepared_ready")
 	var bootstrap *configsock.SandboxTaskSpec
 	sid, e := waitSandboxAssignmentWithRetry(waitCtx, socket, req.RunID, func(ctx context.Context, socket, kind, rid string) (string, error) {
+		trace("assignment_rpc_begin")
 		out, e := configsock.WaitSandboxBootstrap(ctx, socket, rid)
 		if e != nil {
 			return "", e

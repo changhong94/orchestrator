@@ -143,3 +143,49 @@ func adoptPreparedVMTx(ctx context.Context, tx *sql.Tx, sid, runID string) (*Pre
 	}
 	return lease, nil
 }
+
+// AdoptPreparedRestoreVM preserves a paused sandbox's logical ID while
+// transferring an idle restore holder and its port in one durable transaction.
+// The ordinary new-sandbox adoption keeps its same-ID restriction.
+func (s *Store) AdoptPreparedRestoreVM(ctx context.Context, sid, runID string) (*PreparedVMLease, error) {
+	if sid == "" || runID == "" {
+		return nil, errors.New("empty restore assignment identity")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var valid int
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sandboxes WHERE id=? AND state=? AND run_id='' AND vswitch_port='' AND launch_mode=? AND resume_source_kind='snapshot' AND resume_source_ref<>'' AND resume_sandbox_ref<>''`, sid, types.StateStarting, types.LaunchMemory).Scan(&valid)
+	if err != nil || valid != 1 {
+		return nil, errors.Join(err, errors.New("restore target ownership or source lost"))
+	}
+	// Read under the physical runner identity; only the transfer target differs.
+	lease, err := readPreparedVMTx(ctx, tx, runID, runID)
+	if err != nil {
+		return nil, err
+	}
+	var spec struct {
+		RestoreOnly       bool
+		SandboxID, PathID string
+	}
+	if err := json.Unmarshal(lease.Spec, &spec); err != nil || !spec.RestoreOnly || spec.SandboxID != runID || spec.PathID != runID {
+		return nil, errors.New("not an empty restore holder")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE sandboxes SET run_id=?,floatingip=?,vswitch_port=?,inner_ip=?,port_mac=? WHERE id=? AND state=? AND run_id='' AND vswitch_port=''`, runID, lease.FloatingIP, lease.Port, lease.InnerIP, lease.MAC, sid, types.StateStarting)
+	if err != nil {
+		return nil, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n != 1 {
+		return nil, errors.Join(err, errors.New("restore assignment lost"))
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM prepared_vm_leases WHERE run_id=?", runID); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return lease, nil
+}

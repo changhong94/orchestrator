@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
@@ -186,6 +187,7 @@ func (p *runPool) assignNewWithReservation(ctx context.Context, fence func(strin
 }
 
 func (p *runPool) WaitAssignment(ctx context.Context, runID string) (string, bool, error) {
+	poolStage(runID, "wait_handler", time.Now())
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
@@ -458,6 +460,7 @@ func (p *runPool) loop(ctx context.Context) {
 			}
 			return
 		case controlOut <- control:
+			poolStage(control.runID, "control_sent_"+control.op, time.Now())
 			if controlIsStop {
 				stopControls = stopControls[1:]
 				continue
@@ -490,6 +493,7 @@ func (p *runPool) loop(ctx context.Context) {
 				failExhausted()
 			}
 		case req := <-p.waitCh:
+			poolStage(req.runID, "wait_actor", time.Now())
 			req.stopCancel = context.AfterFunc(req.ctx, func() {
 				select {
 				case p.waitCancelCh <- req:
@@ -521,6 +525,7 @@ func (p *runPool) loop(ctx context.Context) {
 			}
 			idle = append(idle, idleRun{runID: req.runID, req: req})
 			p.runs.markState(req.runID, "idle")
+			poolStage(req.runID, "idle_published", time.Now())
 			assign()
 			// Give the ready worker to the oldest request before retiring this
 			// start from the finite waves of all remaining requests.
@@ -615,6 +620,15 @@ func (p *runPool) loop(ctx context.Context) {
 }
 
 func (p *runPool) controlLoop(ctx context.Context) {
+	// Preparation is bounded until readiness by loop; also bound outstanding
+	// systemd jobs. Different durable run identities may start concurrently,
+	// but a Stop for one identity must follow settlement of its Start job.
+	starts := make(map[string]chan struct{})
+	finished := make(chan string, max(1, p.prepareConcurrency))
+	permits := make(chan struct{}, max(1, p.prepareConcurrency))
+	var workers sync.WaitGroup
+	defer workers.Wait()
+
 	type retry struct {
 		next  time.Time
 		delay time.Duration
@@ -623,6 +637,13 @@ func (p *runPool) controlLoop(ctx context.Context) {
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	stop := func(runID string) {
+		if settled := starts[runID]; settled != nil {
+			select {
+			case <-settled:
+			case <-ctx.Done():
+				return
+			}
+		}
 		unit := p.unitName(runID)
 		stopCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
 		err := p.lc.Stop(stopCtx, unit)
@@ -643,6 +664,8 @@ func (p *runPool) controlLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case runID := <-finished:
+			delete(starts, runID)
 		case now := <-tick.C:
 			p.runs.retryRetired(p, now)
 			for runID, retry := range stopping {
@@ -655,13 +678,48 @@ func (p *runPool) controlLoop(ctx context.Context) {
 			unit := p.unitName(req.runID)
 			switch req.op {
 			case "start":
-				startCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
-				err := p.lc.Start(startCtx, unit)
-				cancel()
-				select {
-				case p.startDoneCh <- runStartDone{runID: req.runID, err: err}:
-				case <-ctx.Done():
-					return
+				if _, exists := starts[req.runID]; exists {
+					continue
+				}
+				settled := make(chan struct{})
+				starts[req.runID] = settled
+				launch := func() {
+					startCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
+					startTrace := time.Now()
+					poolStage(req.runID, "start_enter", startTrace)
+					err := p.lc.Start(startCtx, unit)
+					cancel()
+					if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+						fmt.Fprintf(os.Stderr, "POOL_STAGE kind=control run=%s stage=start_job us=%d end_ns=%d\n", req.runID, time.Since(startTrace).Microseconds(), time.Now().UnixNano())
+					}
+					close(settled)
+					if p.prepareConcurrency > 1 {
+						<-permits
+					}
+					select {
+					case p.startDoneCh <- runStartDone{runID: req.runID, err: err}:
+					case <-ctx.Done():
+						return
+					}
+					if p.prepareConcurrency > 1 {
+						select {
+						case finished <- req.runID:
+						case <-ctx.Done():
+						}
+					} else {
+						delete(starts, req.runID)
+					}
+				}
+				if p.prepareConcurrency <= 1 {
+					launch()
+				} else {
+					select {
+					case permits <- struct{}{}:
+					case <-ctx.Done():
+						return
+					}
+					workers.Add(1)
+					go func() { defer workers.Done(); launch() }()
 				}
 			case "stop":
 				stop(req.runID)
@@ -669,5 +727,13 @@ func (p *runPool) controlLoop(ctx context.Context) {
 				p.log.Warn("run pool: unknown unit op", "kind", p.kind, "op", req.op, "run_id", req.runID)
 			}
 		}
+	}
+}
+
+// poolStage is opt-in timing only; no readiness or persistence decisions depend on it.
+func poolStage(runID, stage string, start time.Time) {
+	if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+		now := time.Now()
+		fmt.Fprintf(os.Stderr, "POOL_STAGE kind=actor run=%s stage=%s us=%d end_ns=%d\n", runID, stage, now.Sub(start).Microseconds(), now.UnixNano())
 	}
 }

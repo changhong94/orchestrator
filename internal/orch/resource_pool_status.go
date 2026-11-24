@@ -13,6 +13,7 @@ func (o *Orchestrator) runnerPoolStatus() ([]nodectl.RunnerPoolStatus, int) {
 				n := *p.capacity
 				view.Capacity = &n
 			}
+			view.PreparationHistory = append([]nodectl.PreparationTiming(nil), o.runs.preparationHistory[p.kind+"/"+p.name]...)
 			waiting := 0
 			for id, owner := range o.runs.owners {
 				if owner == p {

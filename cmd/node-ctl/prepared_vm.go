@@ -28,6 +28,7 @@ import (
 var launchPreparedEmbedded func(string, string, []*os.File) (func(), <-chan error, int, int, error)
 
 type preparedSandboxChild struct {
+	sourceHandoff     chan *restore.PreparedSources
 	executable        string
 	cgroupFD, readyFD int
 	cancel            func()
@@ -82,6 +83,15 @@ func startPreparedSandbox(socket, runID string, cgroup *os.File) (_ *preparedSan
 	return startPreparedSandboxContext(context.Background(), socket, runID, cgroup)
 }
 func startPreparedSandboxContext(parent context.Context, socket, runID string, cgroup *os.File) (_ *preparedSandboxChild, retErr error) {
+	traceLast := time.Now()
+	trace := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=runner run=%s stage=%s us=%d end_ns=%d\n", runID, stage, now.Sub(traceLast).Microseconds(), now.UnixNano())
+			traceLast = now
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	spec, err := configsock.FetchPreparedRuntime(ctx, socket, runID)
@@ -94,12 +104,14 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 	if spec.Exec == "" {
 		return nil, errors.New("prepared VM executable missing")
 	}
+	trace("lease_rpc")
 	memtrace.Mark("runtime_spec_fetched")
 	// Initialize only host-side serialization schemas while the generic slot
 	// is being prepared. No image, tenant credential or guest command is read.
 	if err := warmPreparedLaunchCodecs(); err != nil {
 		return nil, fmt.Errorf("prepare launch codecs: %w", err)
 	}
+	trace("codecs")
 	memtrace.Mark("codecs_prepared")
 	var stages *os.File
 	var values []restore.StagedCatalog
@@ -136,6 +148,7 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 		return nil, err
 	}
 	defer rw.Close()
+	trace("stage_catalogs")
 	specDir := filepath.Dir(socket)
 	file, err := os.CreateTemp(specDir, "prepared-"+runID+"-*.json")
 	if err != nil {
@@ -165,6 +178,7 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	p := &preparedSandboxChild{materials: materials, cmd: cmd, executable: cmd.Path, cgroupFD: 5, readyFD: 6, input: lw, readiness: rr, done: make(chan struct{})}
+	trace("spec_file")
 	if instanceenv.Shared(parent) {
 		if launchSharedPrepared == nil {
 			return nil, fmt.Errorf("shared prepared runtime unavailable")
@@ -172,6 +186,8 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 		var result <-chan error
 		p.shared = true
 		p.sharedCgroup = cgroup
+		p.sourceHandoff = make(chan *restore.PreparedSources, 1)
+		parent = restore.WithSourceHandoff(parent, p.sourceHandoff)
 		p.cancel, result, p.cgroupFD, p.readyFD, err = launchSharedPrepared(parent, spec.Exec, file.Name(), []*os.File{lr, pw, cgroup, rw, stages}, values)
 		if err != nil {
 			lw.Close()
@@ -204,6 +220,7 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 	lr.Close()
 	pw.Close()
 	rw.Close()
+	trace("launch_handoff")
 	stop := context.AfterFunc(ctx, func() { pr.Close() })
 	defer stop()
 	raw, err := io.ReadAll(io.LimitReader(pr, 64))
@@ -223,6 +240,7 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 	if !instanceenv.Shared(parent) {
 		debug.FreeOSMemory()
 	}
+	trace("runtime_ready")
 	memtrace.Mark("holder_ready")
 	slog.Info("prepared VM ready", "run_id", runID)
 	return p, nil

@@ -51,6 +51,8 @@ type CarrierBinding struct {
 // Result remains in the tenant task process. Only Summary is sent to the
 // conductor; PreparedSource is appended to sandbox-ctl argv by node-ctl.
 type Result struct {
+	RetainedSources *restore.PreparedSources `json:"-"`
+
 	cacheResolution canonicalResolution
 	PreparedSource  types.ResumeSource
 	// SourceSandboxConfig and SourceImageConfig stay in the tenant task. Build
@@ -97,6 +99,13 @@ type canonicalResolution struct {
 // start a runner, VM, network, or any other runtime side effect.
 func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, error) {
 	started := time.Now()
+	var retained *restore.PreparedSources
+	transferred := false
+	defer func() {
+		if !transferred {
+			retained.Close()
+		}
+	}()
 	sourceKind := types.ResumeSourceKind(spec.RootSourceKind)
 	launchMode := types.LaunchMode(spec.LaunchMode)
 	if err := validateRequest(sourceKind, spec.RootRef, launchMode); err != nil {
@@ -211,6 +220,7 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 			return nil, fmt.Errorf("task artifact prepare: initialize Snapshot reader: %w", err)
 		}
 		document, readErr := reader.Read(ctx, spec.RootRef, restore.SnapshotCfgReadOptions{
+			RetainSources: restore.SourceRetentionRequested(ctx),
 			PrepareSandboxRef: func(raw string) error {
 				name, err := refLocationName(raw)
 				if err != nil {
@@ -221,6 +231,9 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 			RefLocations: pathLocations,
 			RelativeDir:  spec.RelativeDir,
 		})
+		if document != nil {
+			retained = document.Sources
+		}
 		closeErr := reader.Close()
 		if readErr != nil || closeErr != nil {
 			if readErr != nil {
@@ -249,17 +262,24 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		} else if locationErr := addLocation("selected Sandbox E", name); locationErr != nil {
 			return nil, locationErr
 		}
-		sourceStorage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg))
-		if err != nil {
-			return nil, fmt.Errorf("task artifact prepare: initialize referenced Sandbox reader: %w", err)
+		sandboxCfg, imageConfig := document.SandboxConfig, document.ImageConfig
+		if err := addSourceImageRefLocation(sandboxCfg, addLocation); err != nil {
+			return nil, err
 		}
-		sandboxCfg, imageConfig, inspectErr := inspectSandboxSource(
-			ctx, selectedSandbox, spec.RelativeDir, sourceStorage, pathLocations,
-			spec.ReadSourceImageConfig, addLocation,
-		)
-		closeErr = sourceStorage.Close()
-		if inspectErr != nil || closeErr != nil {
-			return nil, errors.Join(inspectErr, closeErr)
+		if spec.ReadSourceImageConfig {
+			sourceStorage, err := artifact.NewProcessStorageWithCustomerKey(manifestCfg, instanceenv.CustomerKey(ctx, manifestCfg))
+			if err != nil {
+				return nil, fmt.Errorf("task artifact prepare: initialize referenced Sandbox reader: %w", err)
+			}
+			var inspectErr error
+			sandboxCfg, imageConfig, inspectErr = inspectSandboxSource(
+				ctx, selectedSandbox, spec.RelativeDir, sourceStorage, pathLocations,
+				spec.ReadSourceImageConfig, addLocation,
+			)
+			closeErr = sourceStorage.Close()
+			if inspectErr != nil || closeErr != nil {
+				return nil, errors.Join(inspectErr, closeErr)
+			}
 		}
 		sourceSandboxConfig, sourceImageConfig = sandboxCfg, imageConfig
 		capacity = configsock.ArtifactCapacity{
@@ -438,7 +458,9 @@ func prepareUncached(ctx context.Context, spec configsock.ArtifactPrepareSpec) (
 		ref.Path = filepath.Join(spec.RelativeDir, ref.Path)
 		prepared.Ref = ref.String()
 	}
+	transferred = true
 	return &Result{
+		RetainedSources:     retained,
 		cacheResolution:     canonical,
 		PreparedSource:      prepared,
 		SourceSandboxConfig: sourceSandboxConfig,

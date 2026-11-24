@@ -67,6 +67,27 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		return launchFailed("artifact_prepare", fmt.Errorf("orch: chmod %s: %w", sb.RunDir, err))
 	}
 
+	// Resume may consume an empty restore holder while retaining the stable
+	// sandbox ID. The DB transfer and active-session fence precede task delivery.
+	if preparation.PreparedListener == nil && sb.LaunchMode == types.LaunchMemory && sb.ResumeSource.Kind == types.ResumeSourceSnapshot && (o.cfg.ResourceListen == nil || !o.cfg.ResourceListen.Enabled) {
+		pools := o.runnerPool.PreparedPool(true)
+		if len(pools.pools) != 0 {
+			claimCtx, cancel := context.WithTimeout(ctx, o.cfg.Units.PoolWaitDuration())
+			_, _, err := pools.AssignNew(claimCtx, "", func(runID string) (bool, func()) { return o.acquireRunSessionAssignmentFence(runKindSandbox, runID) }, func(runID string) (string, error) {
+				unlock := o.lifecycle.Lock(sb.ID)
+				defer unlock()
+				if err := o.adoptPreparedForLaunch(ctx, sb, attempt, preparation, runID, nil); err != nil {
+					return "", err
+				}
+				return sb.ID, nil
+			})
+			cancel()
+			if err != nil {
+				return launchFailed("runner_assignment", err)
+			}
+		}
+	}
+
 	// The listener exists before assignment becomes visible. node-ctl connects
 	// immediately after WaitAssignment, making a task exit during root reading an
 	// observable EOF instead of a launch-wide timeout.
@@ -422,6 +443,8 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: sandbox %s: %w", sb.ID, err))
 	}
+	markReady, finishReady := admissionStageTiming("ready_publish", sb.ID)
+	defer finishReady()
 	for _, b := range binds {
 		if err := o.bindWorkspaceDisk(launchCtx, sb, b, *b.Disk, b.RefLocations); err != nil {
 			return launchFailed("workspace_attach", err)
@@ -436,7 +459,9 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 		}
 	}
 
+	markReady("post_runtime_init")
 	unlock = o.lifecycle.Lock(sb.ID)
+	markReady("lifecycle_lock")
 	defer unlock()
 	sb.WorkspacePlan = effective
 	sb.Metadata = workspace.SetTopology(sb.Metadata, effective)
@@ -444,6 +469,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if summary.DerivedSandboxRef != "" {
 		committedSource.Ref = summary.DerivedSandboxRef
 	}
+	markReady("metadata")
 	changed, err = o.st.CommitPreparedRunning(launchCtx, sb, summary.RootSource, summary.DerivedSandboxRef)
 	if err != nil {
 		return launchFailed("runtime", fmt.Errorf("orch: commit launch %s: %w", sb.ID, err))
@@ -451,6 +477,7 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	if !changed {
 		return launchFailed("runtime", fmt.Errorf("orch: commit launch %s: exact runner ownership lost: %w", sb.ID, errLaunchOwnershipLost))
 	}
+	markReady("durable_running_commit")
 	if attempt.Kind() == launchResume {
 		o.clearDeadlineIntent(sb.ID)
 	}
@@ -481,8 +508,10 @@ func (o *Orchestrator) launchArtifactSandbox(ctx context.Context, attempt *launc
 	sb.ResumeSource = committedSource
 	sb.LaunchMode = ""
 	sb.DeadlineUnix = running.DeadlineUnix
+	markReady("cache")
 	o.publishUpsert(running)
 	o.observeSandboxUpsert(running)
+	markReady("publication")
 	return nil
 }
 

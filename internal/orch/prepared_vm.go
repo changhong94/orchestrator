@@ -26,6 +26,15 @@ import (
 // PreparedRuntimeFor is available only to an authenticated, durably owned idle
 // runner. It contains host configuration, never a tenant image or credentials.
 func (o *Orchestrator) PreparedRuntimeFor(ctx context.Context, runID string) (response *configsock.PreparedRuntimeResponse, resultErr error) {
+	traceLast := time.Now()
+	trace := func(stage string) {
+		if os.Getenv("KUASAR_POOL_TRACE") == "1" {
+			now := time.Now()
+			fmt.Fprintf(os.Stderr, "POOL_STAGE kind=lease run=%s stage=%s us=%d end_ns=%d\n", runID, stage, now.Sub(traceLast).Microseconds(), now.UnixNano())
+			traceLast = now
+		}
+	}
+
 	_, pool, waiting := o.runs.ownerPool(runID)
 	if pool == nil || !pool.preparedVM {
 		return &configsock.PreparedRuntimeResponse{}, nil
@@ -40,7 +49,9 @@ func (o *Orchestrator) PreparedRuntimeFor(ctx context.Context, runID string) (re
 	if err != nil {
 		return nil, err
 	}
+	trace("catalog")
 	o.preparedVMMu.Lock()
+	trace("lock_wait")
 	defer o.preparedVMMu.Unlock()
 	if lease, err := o.st.GetPreparedVM(ctx, runID); err != nil {
 		return nil, err
@@ -59,7 +70,9 @@ func (o *Orchestrator) PreparedRuntimeFor(ctx context.Context, runID string) (re
 	if err != nil {
 		return nil, err
 	}
+	trace("spec_setup")
 	port, err := o.attachNetwork(ctx, network)
+	trace("network_attach")
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +115,11 @@ func (o *Orchestrator) PreparedRuntimeFor(ctx context.Context, runID string) (re
 	}
 	lease := store.PreparedVMLease{RunID: runID, Port: port.Port, FloatingIP: port.FloatingIP, MAC: port.MAC, InnerIP: network.InnerIP, Spec: spec}
 	recoveryLease = &lease
+	trace("encode")
 	if err = o.st.SavePreparedVM(ctx, lease); err != nil {
 		return nil, err
 	}
+	trace("lease_persist")
 	retained = true
 	return &configsock.PreparedRuntimeResponse{Exec: o.executables.SandboxCtl(), Spec: spec, Catalogs: catalogs}, nil
 }
@@ -166,7 +181,7 @@ func (o *Orchestrator) releasePreparedVM(ctx context.Context, runID string) erro
 }
 
 func (o *Orchestrator) adoptPreparedForLaunch(ctx context.Context, sb *types.Sandbox, attempt *launchAttempt, preparation *launchPreparation, runID string, adopted *store.PreparedVMLease) error {
-	if runID != sb.ID || (sb.LaunchMode != types.LaunchCold && sb.LaunchMode != types.LaunchImage && sb.LaunchMode != types.LaunchMemory) {
+	if (runID != sb.ID && sb.LaunchMode != types.LaunchMemory) || (sb.LaunchMode != types.LaunchCold && sb.LaunchMode != types.LaunchImage && sb.LaunchMode != types.LaunchMemory) {
 		return errors.New("invalid prepared VM admission")
 	}
 	if err := os.MkdirAll(sb.RunDir, 0700); err != nil {
@@ -205,7 +220,11 @@ func (o *Orchestrator) adoptPreparedForLaunch(ctx context.Context, sb *types.San
 	}
 	lease := adopted
 	if lease == nil {
-		lease, err = o.st.AdoptPreparedVM(ctx, sb.ID, runID)
+		if runID != sb.ID {
+			lease, err = o.st.AdoptPreparedRestoreVM(ctx, sb.ID, runID)
+		} else {
+			lease, err = o.st.AdoptPreparedVM(ctx, sb.ID, runID)
+		}
 	}
 	if err != nil {
 		listener.Close()

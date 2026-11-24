@@ -9,19 +9,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxproc"
@@ -57,6 +55,8 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 		signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
 		defer signal.Stop(stopSignals)
 	}
+	var retainedSources *restore.PreparedSources
+	defer func() { retainedSources.Close() }()
 	var metricsIdentity runnerMetricsIdentity
 	baseEnvironment := instanceenv.Environ(ctx)
 	instanceEnvironment := map[string]string{}
@@ -73,6 +73,9 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 				return nil, scopeErr
 			}
 			ctx = scoped
+			if instanceenv.Shared(ctx) && (len(prepared) == 0 || prepared[0] == nil || sandboxID != runID) {
+				ctx = restore.RequestSourceRetention(ctx)
+			}
 			var result *taskartifact.Result
 			var err error
 			if len(prepared) > 0 && prepared[0] != nil {
@@ -93,10 +96,13 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 			if result == nil {
 				result, err = taskartifact.Prepare(ctx, spec)
 			}
-			if err == nil && spec.SnapshotRuntime != "" && len(prepared) > 0 && prepared[0] != nil && result.PreparedSource.Kind == types.ResumeSourceSnapshot && strings.HasPrefix(result.PreparedSource.Ref, "file://") {
+			if err == nil && result.RetainedSources == nil && spec.SnapshotRuntime != "" && len(prepared) > 0 && prepared[0] != nil && result.PreparedSource.Kind == types.ResumeSourceSnapshot && strings.HasPrefix(result.PreparedSource.Ref, "file://") {
 				err = json.NewEncoder(prepared[0].input).Encode(map[string]any{"source": map[string]any{
 					"ref": result.PreparedSource.Ref, "sandbox_hint": result.PreparedSource.SandboxRef, "locations": result.RefLocationURIs, "manifest_config": spec.ManifestConfig,
 				}, "env": taskEnvFrom(baseEnvironment, instanceEnvironment)})
+			}
+			if result != nil {
+				retainedSources = result.RetainedSources
 			}
 			return result, err
 		},
@@ -123,6 +129,13 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 		},
 		startChild: func(path string, argv, env []string, vmmCgroup, ready *os.File) error {
 			if len(prepared) > 0 && prepared[0] != nil {
+				if prepared[0].sourceHandoff != nil {
+					select {
+					case prepared[0].sourceHandoff <- retainedSources:
+					default:
+						return errors.New("prepared source capability already delivered")
+					}
+				}
 				return prepared[0].launchAndReport(socket, sandboxID, runID, path, argv, env, ready, metricsIdentity, stopSignals, log)
 			}
 			if instanceenv.Shared(ctx) {
@@ -133,7 +146,9 @@ func launchTaskWithBootstrap(ctx context.Context, stopContext func(), socket, sa
 				if metrics != nil {
 					metrics.captureUsageBaseline(ctx)
 				}
-				return finishSandboxChildAndReport(func() error { return launchSharedRun(ctx, path, argv, env, vmmCgroup, ready) }, socket, sandboxID, runID, metrics)
+				return finishSandboxChildAndReport(func() error {
+					return launchSharedRun(restore.WithPreparedSources(ctx, retainedSources), path, argv, env, vmmCgroup, ready)
+				}, socket, sandboxID, runID, metrics)
 			}
 			return startSandboxChildAndReport(socket, sandboxID, runID, path, argv, env, vmmCgroup, ready, metricsIdentity, stopSignals, log)
 		},
@@ -400,39 +415,6 @@ func launchSpecArtifactArg(args []string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func envDefault(p *string, key string) {
-	if *p == "" {
-		*p = os.Getenv(key)
-	}
-}
-
-// lockPidfile opens path, takes a non-blocking exclusive POSIX lock (fails if another
-// instance already holds it — the double-start guard), and writes our pid. The
-// descriptor stays open in the parent to retain the lock, but is close-on-exec so
-// sandbox-ctl children cannot inherit the parent-owned RunID/Build pidfile. It is
-// never closed and never unlinked — the launcher does not clean up the pidfile.
-func lockPidfile(path string) error { _, err := openLockedPidfile(path); return err }
-func openLockedPidfile(path string) (int, error) {
-	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
-	if err != nil {
-		return -1, fmt.Errorf("open pidfile %s: %w", path, err)
-	}
-	lk := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0, Len: 0}
-	if err := unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &lk); err != nil {
-		unix.Close(fd)
-		return -1, fmt.Errorf("pidfile %s locked (task already running?): %w", path, err)
-	}
-	if err := unix.Ftruncate(fd, 0); err != nil {
-		unix.Close(fd)
-		return -1, fmt.Errorf("truncate pidfile: %w", err)
-	}
-	if _, err := unix.Pwrite(fd, []byte(strconv.Itoa(os.Getpid())+"\n"), 0); err != nil {
-		unix.Close(fd)
-		return -1, fmt.Errorf("write pidfile: %w", err)
-	}
-	return fd, nil
 }
 
 // taskEnv returns the child environment: the inherited env minus the TASK_* bootstrap

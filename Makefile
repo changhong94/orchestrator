@@ -30,7 +30,10 @@ else
 endif
 
 GO             := go
-GO_BUILD_FLAGS := -trimpath
+# Release binaries avoid hashing and caching unused debug sections.
+# Set GO_LDFLAGS= for a DWARF-enabled debugging build.
+GO_LDFLAGS     ?= -s -w
+GO_BUILD_FLAGS := -trimpath -ldflags="$(GO_LDFLAGS)"
 BINDIR         := bin/$(TARGET_ARCH)
 
 define link_bin
@@ -42,7 +45,7 @@ endef
 all: build
 
 # `build` ships the control-plane binaries.
-build: node-ctl node-checkpoint node-runner node-vm-runner node-run-lease cluster-ctl node-stub-ctl e2b-key-ctl
+build: node-ctl node-checkpoint node-register node-runner node-vm-runner node-run-lease cluster-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to derive APISecret and mint API keys from it.
 e2b-key-ctl:
@@ -60,7 +63,7 @@ node-ctl:
 # The VM holder uses exactly the same runner implementation as node-ctl without
 # initializing unrelated control-plane packages in every reserve slot.
 RUNNER_SOURCES := runner_entry.go runner_main.go run_sandbox.go taskrun.go prepared_vm.go \
-	prepared_codecs.go stage_catalog.go runner_cgroup.go runner_metrics.go launch_stages.go shared_controller.go shared_run.go approved_executable.go shared_listener.go
+	prepared_codecs.go stage_catalog.go runner_cgroup.go runner_metrics.go launch_stages.go shared_controller.go shared_run.go shared_registration.go approved_executable.go shared_listener.go
 .PHONY: node-runner
 node-runner:
 	@mkdir -p "$(BINDIR)"
@@ -176,3 +179,10 @@ node-checkpoint:
 	@mkdir -p "$(BINDIR)"
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-checkpoint" ./cmd/node-ctl/checkpoint_entry.go ./cmd/node-ctl/checkpoint.go
 	$(call link_bin,node-checkpoint)
+
+# Credential bootstrap only: reuse safety checks without initializing VM code.
+.PHONY: node-register
+node-register:
+	@mkdir -p "$(BINDIR)"
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o "$(BINDIR)/node-register" ./cmd/node-ctl/register_entry.go ./cmd/node-ctl/shared_registration.go ./cmd/node-ctl/runner_cgroup.go
+	$(call link_bin,node-register)
