@@ -66,3 +66,24 @@ print separately. Use the same digest, command and cache preparation policy for
 both products; report image preparation, first cache fill and idle-slot/refill
 costs separately. Confirm reuse using the same CH PID and a trace showing no
 KVM_CREATE_VM or KVM_CREATE_VCPU during claim, not merely the configured flag.
+
+## Deployment validation
+
+Publish catalogs and the matching generic restore-pool flag together with
+`activate_catalogs.py --config CONDUCTOR.json --credential CONSOLE.json
+--catalog PYTHON.json --catalog NODE.json --catalog RUBY.json --pool-name prepared`.
+Run this only after template preparation succeeds and before restarting the conductor.
+The helper validates all catalogs before an atomic, fsynced configuration update.
+The current prepared-artifact cache requires local snapshot references. Preserve
+normal checkpoint destination configuration; remote checkpoint policy does not imply
+that these reusable image catalogs must use remote references.
+
+Keep prepared-artifact cache directories private (0700). An empty catalog list with
+restore-only slots causes ordinary image requests to take the cold-create fallback;
+a configured pool alone does not prove that the image request used it. Validate an
+ordinary image-ID request and inspect the prepared restore submission/cache-hit logs.
+
+Keep small durable instance-state files on a suitable persistent filesystem. A
+loopback filesystem adds another synchronization layer; measure file and directory
+fsync latency before attributing that time to restore processing. Never remove the
+state publication barrier or use volatile storage to improve benchmark latency.
