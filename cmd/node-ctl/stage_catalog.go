@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/taskartifact"
@@ -37,7 +39,7 @@ func stageArtifactCmd() error {
 
 // stageCatalogValues transfers private per-slot values in the shared host.
 // Validation is unchanged; only the redundant wire roundtrip is removed.
-func stageCatalogValues(ctx context.Context, catalogs []configsock.PreparedCatalog) ([]restore.StagedCatalog, []*taskartifact.SlotMaterial, error) {
+func stageCatalogValues(ctx context.Context, catalogs []configsock.PreparedCatalog, runID ...string) ([]restore.StagedCatalog, []*taskartifact.SlotMaterial, error) {
 	if len(catalogs) == 0 {
 		return nil, nil, nil
 	}
@@ -46,28 +48,40 @@ func stageCatalogValues(ctx context.Context, catalogs []configsock.PreparedCatal
 	}
 	stages := make([]restore.StagedCatalog, 0, len(catalogs))
 	var materials []*taskartifact.SlotMaterial
-	for _, catalog := range catalogs {
+	for index, catalog := range catalogs {
+		var spans strings.Builder
+		last := time.Now()
+		start := last
+		trace := func(phase string) {
+			if os.Getenv("KUASAR_POOL_TRACE") != "1" {
+				return
+			}
+			now := time.Now()
+			fmt.Fprintf(&spans, " %s_ns=%d", phase, now.Sub(last).Nanoseconds())
+			last = now
+		}
 		scoped, err := instanceenv.With(ctx, taskEnvFrom(instanceenv.Environ(ctx), map[string]string{"MANIFEST_KEY": catalog.ManifestKey}))
 		if err != nil {
 			return nil, nil, err
 		}
-		result, err := taskartifact.Prepare(scoped, catalog.Prepare)
+		result, files, material, err := taskartifact.PrepareSlot(scoped, catalog.Prepare)
 		if err != nil {
 			return nil, nil, fmt.Errorf("stage artifact: %w", err)
 		}
-		files, err := taskartifact.StageFiles(catalog.Prepare, result)
-		if err != nil {
-			return nil, nil, err
-		}
-		material, err := taskartifact.PrepareSlotMaterial(scoped, catalog.Prepare)
-		if err != nil {
-			return nil, nil, err
-		}
+		trace("prepare_once")
 		// Keep the original per-catalog admission limit. No bytes are handed
 		// across a process boundary or decoded back into another object graph.
 		budget := &limitedStageWriter{w: io.Discard, left: 4 << 20}
 		if err := json.NewEncoder(budget).Encode(map[string]any{"material": material, "ref": result.PreparedSource.Ref, "sandbox_hint": result.PreparedSource.SandboxRef, "locations": result.RefLocationURIs, "manifest_config": catalog.Prepare.ManifestConfig, "files": files}); err != nil {
 			return nil, nil, err
+		}
+		trace("limits")
+		if spans.Len() != 0 {
+			id := ""
+			if len(runID) > 0 {
+				id = runID[0]
+			}
+			fmt.Fprintf(os.Stderr, "POOL_CATALOG run=%s index=%d start_ns=%d end_ns=%d%s\n", id, index, start.UnixNano(), last.UnixNano(), spans.String())
 		}
 		if material != nil {
 			materials = append(materials, material)

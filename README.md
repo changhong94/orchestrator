@@ -129,11 +129,16 @@ Cold runners and native running-parent fork children retain the standalone
 controller path. This does not change disk persistence or guest RAM CoW.
 
 An alternative shared-controller mode covers prepared slots, cold starts and
-children of a running-parent fork. Build `node-runner`, `node-vm-runner`,
+children of a running-parent fork. Build `node-register`, `node-vm-runner`,
 `node-run-lease` and the matching `sandbox-ctl`. Run
 `node-vm-runner shared-runs /absolute/private/runs.sock` in its own service,
-with a root-only parent directory. Instance units invoke
-`node-runner register-shared` with their usual `--pidfile`, `--config-socket`
+with a root-only parent directory. Configure this service with `Type=notify`
+and `NotifyAccess=main`: it sends `READY=1` only after the owned socket is
+listening with mode 0600. Dependent instance units must have both `Requires=`
+and `After=` for this service. `Type=simple` can release instances before the
+socket exists and cause failed registrations and refill retries.
+Instance units invoke the lightweight
+`node-register register-shared` with their usual `--pidfile`, `--config-socket`
 and `--run-id`, and set `KUASAR_SHARED_RUN_SOCKET` and
 `KUASAR_NATIVE_RUN_PROXY` to absolute paths. Keep the embedded sandbox digest
 check and bind instance units to the shared-controller service lifecycle.
@@ -141,6 +146,9 @@ The initial Go registrar execs the native lease process at the same PID; there
 is no resident per-instance Go proxy. The native process retains the instance
 PID lock and opens authorization connections, so the existing config-socket
 peer-credential check still sees the instance PID, not a controller allowlist.
+Use the `make node-register` target, which builds only the registration entry,
+shared registration and cgroup files. Linking the VM engine into this short-lived
+registrar repeats unnecessary package initialization for every pool slot.
 
 In shared mode, prepared catalog metadata transfers directly as privately owned
 Go values. Legacy subprocess mode retains the sealed descriptor transport.

@@ -3,7 +3,8 @@
 Description=Kuasar shared prepared VM controller
 After=store-ctl.service
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 RuntimeDirectory=kuasar-shared-controller
 RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/node-vm-runner shared-runs /run/kuasar-shared-controller/runs.sock

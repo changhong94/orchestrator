@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandboxer/pkg/controllease"
 	"github.com/kuasar-sandbox/sandboxer/pkg/instanceenv"
@@ -136,6 +137,13 @@ func serveSharedRuns(ctx context.Context, path string) error {
 	defer closeListener()
 	if e = os.Chmod(path, 0600); e != nil {
 		return e
+	}
+	// Type=notify orders dependent registrars after the owned, private listener
+	// exists. Type=simple only ordered them after exec and could start a retry
+	// storm while this process was still initializing. No timer or retry delay
+	// substitutes for readiness, and authorization remains per connection.
+	if _, e = daemon.SdNotify(true, daemon.SdNotifyReady); e != nil {
+		return fmt.Errorf("notify shared listener readiness: %w", e)
 	}
 	stop := context.AfterFunc(ctx, func() { l.Close() })
 	defer stop()

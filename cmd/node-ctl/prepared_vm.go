@@ -117,7 +117,7 @@ func startPreparedSandboxContext(parent context.Context, socket, runID string, c
 	var values []restore.StagedCatalog
 	var materials []*taskartifact.SlotMaterial
 	if instanceenv.Shared(parent) {
-		values, materials, err = stageCatalogValues(ctx, spec.Catalogs)
+		values, materials, err = stageCatalogValues(ctx, spec.Catalogs, runID)
 	} else {
 		stages, materials, err = stageCatalogFile(ctx, spec.Catalogs)
 	}

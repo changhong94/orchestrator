@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandboxer/pkg/restore"
 )
 
 // SlotMaterial is private host metadata passed only from an authenticated
@@ -50,6 +51,56 @@ func PrepareSlotMaterial(ctx context.Context, spec configsock.ArtifactPrepareSpe
 		return nil, err
 	}
 	return &SlotMaterial{Request: spec, RootSandboxRef: spec.RootSandboxRef, Identity: access.aad, Entry: *entry}, nil
+}
+
+// PrepareSlot returns all views of one authenticated cache read. Nothing is
+// retained globally: the material remains private to this slot and Claim still
+// rechecks authority, request identity and every source file before use.
+func PrepareSlot(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, map[string]restore.StageFileVersion, *SlotMaterial, error) {
+	if spec.SnapshotRuntime != "" {
+		if result, files, material, err := loadSlotPreparation(ctx, spec); err == nil {
+			return result, files, material, nil
+		}
+	}
+	// Keep the original cold/missing/invalid-cache behavior and its validation.
+	result, err := Prepare(ctx, spec)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	files, err := StageFiles(spec, result)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	material, err := PrepareSlotMaterial(ctx, spec)
+	return result, files, material, err
+}
+func loadSlotPreparation(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, map[string]restore.StageFileVersion, *SlotMaterial, error) {
+	started := time.Now()
+	access, err := preparedCacheForContext(ctx, spec)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if access == nil {
+		return nil, nil, nil, errors.New("slot preparation cache unavailable")
+	}
+	entry, err := access.readEntry(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	result, err := consumePreparedEntry(ctx, spec, entry)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// consumePreparedEntry has just compared fresh stamps to these signed stamps.
+	// Copy the typed view instead of restatting and decoding the same entry again.
+	files := make(map[string]restore.StageFileVersion, len(entry.Files))
+	for path, stamp := range entry.Files {
+		files[path] = restore.StageFileVersion(stamp)
+	}
+	result.PrepareDuration = time.Since(started)
+	result.ConfigReadDuration = result.PrepareDuration
+	material := &SlotMaterial{Request: spec, RootSandboxRef: spec.RootSandboxRef, Identity: access.aad, Entry: *entry}
+	return result, files, material, nil
 }
 
 func (s *SlotMaterial) Claim(ctx context.Context, spec configsock.ArtifactPrepareSpec) (*Result, bool, error) {

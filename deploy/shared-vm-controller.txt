@@ -24,6 +24,13 @@ Environment=KUASAR_EMBEDDED_SANDBOX_SHA256=<sha256 of matching sandbox-ctl>
 # ExecStart invokes node-register register-shared with the same arguments.
 # Legacy node-runner register-shared remains compatible but initializes more Go code.
 
+The controller service uses Type=notify and NotifyAccess=main. READY=1 is sent
+only after the owned registration socket is listening with mode0600. Type=simple
+does not wait for this condition: fast registrars can fail with ENOENT and cause
+refill retries during controller startup. A configured notification failure
+closes the listener and fails startup; direct CLI use without NOTIFY_SOCKET is
+still supported. No fixed sleep or relaxed peer authorization is needed.
+
 Use a root-owned mode0700 socket directory and deployment-specific storage/cache
 settings in the controller service. Host launch paths must be absolute; instances
 never change the shared process cwd or environment. Interactive host stdio is
