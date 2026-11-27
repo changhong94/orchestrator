@@ -2605,13 +2605,22 @@ func validateAPISecretFingerprint(fingerprint string) error {
 // the 24-hex prefix carried in an API key. A prefix is not authoritative: the
 // caller must verify the API-key MAC against every returned APISecret.
 func (s *Store) AllowedKeyPairsByAPISecretHashPrefix(ctx context.Context, prefix string) ([]KeyPair, error) {
+	mark, done := admissionTiming("allowlist_read", "")
+	defer done()
 	if len(prefix) != apiSecretCandidateHashLen || !hexCandidateHashRE.MatchString(prefix) {
 		return nil, fmt.Errorf("store: API secret hash prefix must be 24 lowercase hex characters")
 	}
-	rows, err := s.readDB().QueryContext(ctx, `
+	conn, err := s.readDB().Conn(ctx)
+	mark("connection_wait")
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	rows, err := conn.QueryContext(ctx, `
 SELECT api_secret_hash,api_secret_enc,manifest_key_hash,manifest_key_enc FROM manifest_keys
 WHERE substr(api_secret_hash,1,24)=? AND (expires_unix=0 OR expires_unix>?)`,
 		prefix, time.Now().Unix())
+	mark("query")
 	if err != nil {
 		return nil, err
 	}
@@ -2628,6 +2637,7 @@ WHERE substr(api_secret_hash,1,24)=? AND (expires_unix=0 OR expires_unix>?)`,
 		}
 		out = append(out, pair)
 	}
+	mark("scan_decrypt_verify")
 	return out, rows.Err()
 }
 
