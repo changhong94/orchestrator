@@ -903,7 +903,7 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 // Sandbox BaseDir/checkpoint; MergeRef and DropCaches apply only to
 // CaptureSnapshot and override sandbox-ctl's snapshot defaults when set.
 type CheckpointConfig struct {
-	// SnapshotTarget selects snapshot-backed fork publication without changing input location resolution.
+	// SnapshotTarget selects exported snapshot and snapshot-backed fork publication without changing input location resolution.
 	SnapshotTarget string                 `yaml:"snapshot_target" json:"snapshot_target,omitempty"` // empty: existing destination; location | manifest
 	Mode           string                 `yaml:"mode" json:"mode"`                                 // local (default) | bundle
 	MergeRef       *bool                  `yaml:"merge_ref" json:"merge_ref"`                       // nil delegates to sandbox-ctl

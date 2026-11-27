@@ -3402,7 +3402,7 @@ func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, source ty
 		return artifact.PublishReport{}, fmt.Errorf("orch: promote %s: invalid resume source", sb.ID)
 	}
 	args := []string{"publish", "--json", "--quiet", "--manifest-config", o.cfg.ManifestConfig}
-	if o.cfg.Checkpoint.Remote.RefLocationParent != "" {
+	if o.cfg.Checkpoint.SnapshotTarget != "manifest" && o.cfg.Checkpoint.Remote.RefLocationParent != "" {
 		// Publication location name: the sandbox's stable identity. The name
 		// is the directory key, so every publication of one logical entity —
 		// across renames (import with a new target id), node migrations, and
