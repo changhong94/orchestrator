@@ -61,6 +61,23 @@ def prime_restore(args, console, result):
         result['costs_ms']['first_restore_priming_including_delete'])
 
 
+def pause_and_publish(console, sandbox_id):
+    base = console['api'].rstrip('/') + '/sandboxes/' + sandbox_id
+    headers = {'X-API-Key': console['key'], 'Content-Type': 'application/json'}
+    for endpoint, body in [('/pause', {'memory': True}),
+                           ('/export', {'toTemplate': True, 'keepSource': True})]:
+        request = urllib.request.Request(base + endpoint,
+            data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(request, timeout=300) as response:
+            raw = response.read()
+    published = json.loads(raw)
+    template = published.get('result')
+    if not isinstance(template, str) or not template:
+        raise RuntimeError('paused template publication returned no template ID')
+    return {'templateID': template, 'metadata': {
+        'kuasar-sandbox.restore': json.dumps({'fork_identity': True})}}
+
+
 def prepare(args):
     if not 0 <= args.read_budget <= 512 * 1024 * 1024:
         raise ValueError('read budget must be between 0 and 512 MiB')
@@ -110,11 +127,9 @@ def prepare(args):
             if cache['errors'] or cache['application_executed']:
                 raise RuntimeError('image preparation did not satisfy its policy')
             cached = time.monotonic_ns()
-            request = urllib.request.Request(console['api'].rstrip('/') + '/sandboxes/' +
-                sb.sandbox_id + '/snapshots', data=b'{}', headers={
-                'X-API-Key': console['key'], 'Content-Type': 'application/json'})
-            with urllib.request.urlopen(request, timeout=300) as response:
-                snapshot = json.load(response)
+            # Template seeds are disposable: persist them through ordinary pause,
+            # then publish the paused state. No running-snapshot API is required.
+            snapshot = pause_and_publish(console, sb.sandbox_id)
             saved = time.monotonic_ns()
             result = dict(identity=identity, template=snapshot, cache=cache,
                 staging_credential_file=str(args.console.resolve()),

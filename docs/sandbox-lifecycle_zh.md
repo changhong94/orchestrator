@@ -1282,20 +1282,3 @@ E、S 路径观测超过 60 秒的实际 Manifest Get 故障，核对 SID、RunI
 E/S prepare 先于 VM 创建；Sandboxer 恢复用例另行证明 post-ACK 及普通读取故障
 期间原 VM 存活。须记录实际选定 SDK 和 Guest Bundle，不能只用本地相对 replace
 构建成功证明正式 CI 的输入。
-
-### 运行中快照及发布目的地
-
-`POST /sandboxes/{id}/snapshots` 捕获运行中的沙箱，返回可复用的 `templateID`
-和恢复元数据，沿用快照式 fork 的捕获和持久化屏障。返回元数据不携带宿主专用的
-原生 fork 父子关系字段：从保存的快照创建的是独立执行实例，不是重新连接原实例的 RAM。
-
-`checkpoint.snapshot_target` 选择这条运行中快照路径的发布目的地：
-
-- 空值：保持现有的目的地选择规则。
-- `location`：发布到 `checkpoint.remote.ref_location_parent`，必须配置该目录。
-- `manifest`：将快照及依赖图完整发布到 Manifest Store，包括具名目录中的文件依赖。
-  此时具名目录配置仍用于解析输入，不再决定输出目的地。
-
-此设置不改变 `checkpoint.mode=local|bundle` 的捕获载体含义，也不改变普通暂停
-checkpoint 的归属和位置。Manifest 发布先提交依赖、最后提交根；API 必须在发布成功后
-才能返回可复用模板。原沙箱可在捕获屏障完成后提前恢复运行。

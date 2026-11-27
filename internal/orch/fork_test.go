@@ -46,19 +46,6 @@ esac
 	if err := os.WriteFile(o.executables.NodeCtl, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := o.SnapshotRunningSandbox(context.Background(), key, parent.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshot.TemplateID == "" || snapshot.ElapsedMS < 0 {
-		t.Fatal("live snapshot did not publish reusable template")
-	}
-	if _, ok := snapshot.Metadata[nativeForkParentKey]; ok {
-		t.Fatal("snapshot leaked host-owned lineage into Create metadata")
-	}
-	if _, ok := snapshot.Metadata[sandboxcfg.NsCredentials]; ok {
-		t.Fatal("live snapshot leaked source credentials")
-	}
 	child, err := o.ForkSandbox(context.Background(), key, parent.ID, 60)
 	if err != nil {
 		t.Fatal(err)

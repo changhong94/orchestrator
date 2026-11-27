@@ -502,7 +502,6 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{id}/exec-sessions", a.authAPIKey(a.execSession))
 	mux.HandleFunc("POST /sandboxes/{id}/pause", a.auth(a.pause))
 	mux.HandleFunc("POST /sandboxes/{id}/fork", a.auth(a.forkSandbox))
-	mux.HandleFunc("POST /sandboxes/{id}/snapshots", a.auth(a.snapshotRunningSandbox))
 	mux.HandleFunc("POST /sandboxes/{id}/reset", a.auth(a.reset))
 	mux.HandleFunc("POST /sandboxes/{id}/timeout", a.auth(a.timeout))
 	// Template build (e2b v3). The CLI authenticates with a Bearer access token;
